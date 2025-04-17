@@ -1,4 +1,5 @@
-﻿using System;
+﻿
+using System;
 using System.Windows.Forms;
 
 namespace WinForms_OAuth2ImplicitFlow_Prototype
@@ -13,13 +14,13 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-
+            
             // Subscribe to the TokenReceived event
             AuthenticationManager.TokenReceived += OnTokenReceived;
 
             // Subscribe to the TokenFailed event
             AuthenticationManager.TokenFailed += OnTokenFailed;
-
+            
             // IMPORTANT: Update the redirect URI to match the fixed port used in FixedPortAuthService
             var config = new AuthConfig
             {
@@ -28,14 +29,14 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 // Use a fixed port redirect URI that must be whitelisted with your IDP
                 RedirectUri = "http://localhost:54321/callback",
             };
-
+            
             // Initialize the authentication manager
             AuthenticationManager.Initialize(config);
 
             // Run the main form
             Application.Run(new EntryPointForm());
         }
-
+        
         private static void OnTokenReceived(object sender, TokenReceivedEventArgs args)
         {
             MessageBox.Show(
@@ -45,7 +46,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 MessageBoxIcon.Information
             );
         }
-
+        
         private static void OnTokenFailed(object sender, string reason)
         {
             MessageBox.Show(
