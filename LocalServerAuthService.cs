@@ -1,11 +1,12 @@
-﻿
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text;
 using System.Threading;
@@ -29,6 +30,30 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private string _state;
         private string _nonce;
         private WebBrowser _hiddenBrowser;
+        private CancellationTokenSource _minimizerCts;
+        private Form _progressForm;
+
+        // Win32 API for window manipulation
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        // Window constants
+        private const int SW_MINIMIZE = 6;
+
         public FixedPortAuthService(AuthConfig authConfig, Action<string> statusCallback = null, bool hideBrowser = false)
         {
             _authConfig = authConfig ?? throw new ArgumentNullException(nameof(authConfig));
@@ -49,6 +74,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             _logMessage("Starting authentication process...");
             Debug.WriteLine("Starting fixed port authentication");
 
+            // Show the progress form
+            ShowProgressForm();
+
             _fragmentReceived = new TaskCompletionSource<Dictionary<string, string>>();
 
             //Create a fixed redirect URI using the specified port
@@ -60,7 +88,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 try
                 {
                     //Set up the HTTP listener for capturing the redirect
-
                     httpListener.Prefixes.Add($"http://localhost:{FixedPort}/callback/");
                     httpListener.Prefixes.Add($"http://localhost:{FixedPort}/fragment/");
 
@@ -68,6 +95,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         httpListener.Start();
                         _logMessage("Listener started successfully");
+                        UpdateProgressStatus("HTTP listener started successfully");
                     }
                     catch (HttpListenerException ex)
                     {
@@ -87,6 +115,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 {
                     //Clean up
                     CleanupResources(httpListener);
+                    CloseProgressForm();
                 }
             }
         }
@@ -116,6 +145,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private string BuildAuthorizationUrl(string redirectUri)
         {
             _logMessage("Preparing authentication URL...");
+            UpdateProgressStatus("Preparing authentication URL");
+
             var request = new RequestUrl(GetAuthorizeUrlBasedOnEnvironment());
             var url = request.CreateAuthorizeUrl(
                 clientId: _authConfig.ClientId,
@@ -134,11 +165,13 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private async Task LaunchBrowserAndListenForCallback(string authUrl, HttpListener httpListener)
         {
             _logMessage("Launching browser...");
+            UpdateProgressStatus("Launching authentication browser");
 
             // Launch browser
-            if (!LaunchAppropriateAndAvailableBrowser(authUrl))
+            if (!LaunchHiddenBrowser(authUrl))
             {
                 _logMessage("Error: Failed to launch browser.");
+                UpdateProgressStatus("Failed to launch browser");
                 throw new InvalidOperationException("Failed to launch browser. Please check if a browser is installed.");
             }
 
@@ -149,6 +182,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             using (var cts = new CancellationTokenSource(AuthenticationTimeoutMilliseconds))
             {
                 _logMessage("Waiting for authentication in browser...");
+                UpdateProgressStatus("Waiting for authentication...");
 
                 try
                 {
@@ -165,17 +199,20 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     ValidateAuthenticationResponse(tokenDict);
 
                     _logMessage("Authentication successful!");
+                    UpdateProgressStatus("Authentication successful!");
                     TerminateBrowserProcess();
                 }
                 catch (TimeoutException)
                 {
                     _logMessage("Authentication timed out. Please try again.");
+                    UpdateProgressStatus("Authentication timed out. Please try again.");
                     TerminateBrowserProcess();
                     throw;
                 }
                 catch (Exception ex)
                 {
                     _logMessage($"Authentication error: {ex.Message}");
+                    UpdateProgressStatus($"Authentication error: {ex.Message}");
                     TerminateBrowserProcess();
                     throw;
                 }
@@ -276,6 +313,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 if (path.StartsWith("/callback"))
                 {
                     await SendCallbackPageAsync(context);
+                    UpdateProgressStatus("Processing authentication callback");
                 }
                 else if (path.StartsWith("/fragment"))
                 {
@@ -313,6 +351,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
             }
         }
+
         private async Task ProcessFragmentPostDataAsync(HttpListenerContext context)
         {
             try
@@ -347,17 +386,20 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         _fragmentReceived.TrySetResult(parsedData);
                         Debug.WriteLine("Successfully parsed and processed fragment data");
+                        UpdateProgressStatus("Authentication data received");
                     }
                     else
                     {
                         _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
                         Debug.WriteLine("Empty fragment data received");
+                        UpdateProgressStatus("Error: Empty authentication data");
                     }
                 }
                 else
                 {
                     _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
                     Debug.WriteLine("No fragment data received");
+                    UpdateProgressStatus("Error: No authentication data received");
                 }
 
                 // Send a clear success response
@@ -667,107 +709,182 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             return fragmentData;
         }
 
-        private bool LaunchAppropriateAndAvailableBrowser(string url)
-        {
-            _logMessage("Launching authentication browser...");
-
-            if (_hideBrowser)
-            {
-                return LaunchHiddenBrowser(url);
-            }
-            else
-            {
-                return LaunchVisibleBrowser(url);
-            }
-        }
-
         private bool LaunchHiddenBrowser(string url)
         {
             try
             {
-                // Try Chrome-based browsers in app mode with minimal window
-                string browserPath = GetChromiumBasedBrowserPath();
+                // Stop any existing minimizer
+                StopMinimizeThread();
+
+                // Get browser path - try Edge first (usually more reliable)
+                string browserPath = GetEdgeBrowserExecutable();
+                if (string.IsNullOrEmpty(browserPath))
+                {
+                    browserPath = GetChromeBrowserExecutable();
+                }
+
+                _logMessage("Launching browser with minimal window...");
+                UpdateProgressStatus("Launching browser...");
 
                 if (!string.IsNullOrEmpty(browserPath))
                 {
+                    // For Chrome/Edge, a combination of flags that's most likely to work
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
                         FileName = browserPath,
-                        Arguments = $"--start-minimized --app=\"{url}\" -silent",
+                        // Key arguments to try to keep minimized
+                        Arguments = $"--new-window --start-minimized \"{url}\"",
                         WindowStyle = ProcessWindowStyle.Minimized,
                         UseShellExecute = true
                     };
 
                     _browserProcess = Process.Start(psi);
-                    return true;
+                    _logMessage($"Browser process started with ID: {_browserProcess?.Id}");
                 }
-
-                // Fallback to default browser
-                ProcessStartInfo defaultPsi = new ProcessStartInfo
+                else
                 {
-                    FileName = url,
-                    WindowStyle = ProcessWindowStyle.Minimized,
-                    UseShellExecute = true
-                };
-
-                _browserProcess = Process.Start(defaultPsi);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error launching hidden browser: {ex.Message}");
-                return false;
-            }
-        }
-
-        private bool LaunchVisibleBrowser(string url)
-        {
-            try
-            {
-                // Try Chrome-based browsers in app mode
-                string browserPath = GetChromiumBasedBrowserPath();
-
-                if (!string.IsNullOrEmpty(browserPath))
-                {
+                    // Fallback to default browser
+                    _logMessage("Using default browser...");
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
-                        FileName = browserPath,
-                        Arguments = $"--new-window --app=\"{url}\"",
+                        FileName = url,
+                        WindowStyle = ProcessWindowStyle.Minimized,
                         UseShellExecute = true
                     };
 
                     _browserProcess = Process.Start(psi);
-                    return true;
                 }
 
-                // Fallback to default browser
-                _browserProcess = Process.Start(url);
+                // Start the minimizer thread to continuously keep the browser minimized
+                StartMinimizeThread();
+
                 return true;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error launching browser: {ex.Message}");
+                _logMessage($"Error launching browser: {ex.Message}");
+                Debug.WriteLine($"Launch browser error: {ex.Message}");
                 return false;
             }
         }
 
-        private string GetChromiumBasedBrowserPath()
+        private void StopMinimizeThread()
         {
-            // Try Edge first
-            string edgePath = GetEdgeBrowserExecutable();
-            if (!string.IsNullOrEmpty(edgePath) && File.Exists(edgePath))
+            if (_minimizerCts != null)
             {
-                return edgePath;
+                try
+                {
+                    _minimizerCts.Cancel();
+                    _minimizerCts.Dispose();
+                }
+                catch { /* Ignore */ }
+                _minimizerCts = null;
+            }
+        }
+
+        private void StartMinimizeThread()
+        {
+            // This is the main minimizer that continues during the authentication process
+            if (_minimizerCts == null)
+            {
+                _minimizerCts = new CancellationTokenSource();
             }
 
-            // Then try Chrome
-            string chromePath = GetChromeBrowserExecutable();
-            if (!string.IsNullOrEmpty(chromePath) && File.Exists(chromePath))
-            {
-                return chromePath;
-            }
+            Task.Run(() => {
+                try
+                {
+                    // Keep trying to minimize windows for 2 minutes (or until cancelled)
+                    DateTime startTime = DateTime.Now;
+                    while ((DateTime.Now - startTime).TotalMinutes < 2 && !_minimizerCts.Token.IsCancellationRequested)
+                    {
+                        // Minimize the browser window
+                        MinimizeBrowser();
 
-            return string.Empty;
+                        // Check less frequently over time for performance
+                        if ((DateTime.Now - startTime).TotalSeconds < 10)
+                        {
+                            Thread.Sleep(100); // Check frequently at first
+                        }
+                        else if ((DateTime.Now - startTime).TotalSeconds < 30)
+                        {
+                            Thread.Sleep(500); // Check less often after 10 seconds
+                        }
+                        else
+                        {
+                            Thread.Sleep(1000); // Check rarely after 30 seconds
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Minimizer thread error: {ex.Message}");
+                }
+            }, _minimizerCts.Token);
+        }
+
+        private void MinimizeBrowser()
+        {
+            try
+            {
+                int browserPid = _browserProcess?.Id ?? -1;
+
+                // If we don't have a browser process ID, there's nothing to do
+                if (browserPid <= 0) return;
+
+                // Use EnumWindows to find all top-level windows
+                EnumWindows(new EnumWindowsProc((hWnd, lParam) => {
+                    try
+                    {
+                        // Skip invisible windows
+                        if (!IsWindowVisible(hWnd))
+                            return true;
+
+                        // Get the process ID for this window
+                        uint windowPid;
+                        GetWindowThreadProcessId(hWnd, out windowPid);
+
+                        // Only minimize windows belonging to our browser process
+                        if (windowPid == browserPid)
+                        {
+                            ShowWindow(hWnd, SW_MINIMIZE);
+
+                            // Optional: log the window title for debugging
+                            StringBuilder sb = new StringBuilder(256);
+                            GetWindowText(hWnd, sb, sb.Capacity);
+                            Debug.WriteLine($"Minimized browser window: {sb.ToString()}");
+                        }
+                    }
+                    catch { /* Ignore errors in window checks */ }
+
+                    // Continue enumeration
+                    return true;
+                }), IntPtr.Zero);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"MinimizeBrowser error: {ex.Message}");
+            }
+        }
+
+        private void TerminateBrowserProcess()
+        {
+            // Stop the minimizer thread
+            StopMinimizeThread();
+
+            // Now terminate the browser
+            try
+            {
+                if (_browserProcess != null && !_browserProcess.HasExited)
+                {
+                    _browserProcess.Kill();
+                    _browserProcess.Dispose();
+                    _browserProcess = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error terminating browser: {ex.Message}");
+            }
         }
 
         private static string GetEdgeBrowserExecutable()
@@ -855,23 +972,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
-        private void TerminateBrowserProcess()
-        {
-            try
-            {
-                if (_browserProcess != null && !_browserProcess.HasExited)
-                {
-                    _browserProcess.Kill();
-                    _browserProcess.Dispose();
-                    _browserProcess = null;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error terminating browser: {ex.Message}");
-            }
-        }
-
         public ClaimsPrincipal CreateClaimsPrincipal(Dictionary<string, string> tokenDict)
         {
             if (tokenDict == null)
@@ -937,5 +1037,221 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 identity.AddClaim(new Claim(ClaimsIdentity.DefaultNameClaimType, cleanName));
             }
         }
+
+        #region Progress Form Methods
+
+        private void ShowProgressForm()
+        {
+            try
+            {
+                // Create progress form on UI thread
+                if (Application.OpenForms.Count > 0)
+                {
+                    Application.OpenForms[0].Invoke((MethodInvoker)delegate
+                    {
+                        _progressForm = CreateProgressForm();
+                        _progressForm.Show();
+                        _progressForm.BringToFront();
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error creating progress form: {ex.Message}");
+            }
+        }
+
+        private Form CreateProgressForm()
+        {
+            var form = new Form
+            {
+                Text = "Authentication",
+                Width = 450,
+                Height = 280,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ControlBox = true,
+                ShowIcon = true,
+                BackColor = Color.White
+            };
+
+            // Add a logo at the top
+            var logoPanel = new Panel
+            {
+                BackColor = Color.FromArgb(0, 120, 212), // Microsoft Blue
+                Height = 70,
+                Dock = DockStyle.Top
+            };
+
+            var logoLabel = new Label
+            {
+                Text = "🔒",
+                Font = new Font("Segoe UI", 26, FontStyle.Regular),
+                ForeColor = Color.White,
+                AutoSize = true,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Location = new Point(20, 12)
+            };
+            logoPanel.Controls.Add(logoLabel);
+
+            var headerLabel = new Label
+            {
+                Text = "Secure Authentication",
+                Font = new Font("Segoe UI Semibold", 15, FontStyle.Regular),
+                ForeColor = Color.White,
+                AutoSize = true,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(70, 20)
+            };
+            logoPanel.Controls.Add(headerLabel);
+
+            form.Controls.Add(logoPanel);
+
+            // Add title and instructions
+            var titleLabel = new Label
+            {
+                Text = "Authenticating your account",
+                Font = new Font("Segoe UI Semibold", 14, FontStyle.Regular),
+                AutoSize = true,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(30, 90)
+            };
+            form.Controls.Add(titleLabel);
+
+            var instructionsLabel = new Label
+            {
+                Text = "Please wait while we authenticate your account with Microsoft. This process is handled automatically in the background.",
+                Font = new Font("Segoe UI", 9, FontStyle.Regular),
+                AutoSize = false,
+                Width = 390,
+                Height = 40,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(30, 120)
+            };
+            form.Controls.Add(instructionsLabel);
+
+            // Add a status label
+            var statusLabel = new Label
+            {
+                Text = "Initializing authentication...",
+                Font = new Font("Segoe UI", 9, FontStyle.Regular),
+                AutoSize = false,
+                Width = 390,
+                Height = 20,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(30, 165),
+                Tag = "status" // We'll use this tag to find the label later
+            };
+            form.Controls.Add(statusLabel);
+
+            // Add a progress bar
+            var progressBar = new ProgressBar
+            {
+                Style = ProgressBarStyle.Marquee,
+                MarqueeAnimationSpeed = 30,
+                Height = 5,
+                Width = 390,
+                Location = new Point(30, 190)
+            };
+            form.Controls.Add(progressBar);
+
+            // Add a cancel button
+            var cancelButton = new Button
+            {
+                Text = "Cancel",
+                Width = 100,
+                Height = 30,
+                Location = new Point(320, 210),
+                UseVisualStyleBackColor = true
+            };
+            cancelButton.Click += (sender, e) =>
+            {
+                form.Close();
+                AuthenticationManager.RaiseTokenFailed("Authentication was canceled by the user.");
+            };
+            form.Controls.Add(cancelButton);
+
+            // Handle form closing
+            form.FormClosing += (sender, e) =>
+            {
+                if (e.CloseReason == CloseReason.UserClosing)
+                {
+                    Debug.WriteLine("User canceled authentication");
+                    AuthenticationManager.RaiseTokenFailed("Authentication was canceled by the user.");
+                }
+            };
+
+            return form;
+        }
+
+        private void UpdateProgressStatus(string status)
+        {
+            if (_progressForm != null)
+            {
+                try
+                {
+                    if (_progressForm.InvokeRequired)
+                    {
+                        _progressForm.Invoke((MethodInvoker)delegate {
+                            if (!_progressForm.IsDisposed)
+                            {
+                                var statusLabel = _progressForm.Controls.Find("status", true);
+                                if (statusLabel.Length > 0 && statusLabel[0] is Label)
+                                {
+                                    ((Label)statusLabel[0]).Text = status;
+                                }
+                            }
+                        });
+                    }
+                    else if (!_progressForm.IsDisposed)
+                    {
+                        var statusLabel = _progressForm.Controls.Find("status", true);
+                        if (statusLabel.Length > 0 && statusLabel[0] is Label)
+                        {
+                            ((Label)statusLabel[0]).Text = status;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error updating status: {ex.Message}");
+                }
+            }
+        }
+
+        private void CloseProgressForm()
+        {
+            if (_progressForm != null)
+            {
+                try
+                {
+                    if (_progressForm.InvokeRequired)
+                    {
+                        _progressForm.Invoke((MethodInvoker)delegate {
+                            if (!_progressForm.IsDisposed)
+                            {
+                                _progressForm.Close();
+                                _progressForm.Dispose();
+                                _progressForm = null;
+                            }
+                        });
+                    }
+                    else if (!_progressForm.IsDisposed)
+                    {
+                        _progressForm.Close();
+                        _progressForm.Dispose();
+                        _progressForm = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error closing progress form: {ex.Message}");
+                }
+            }
+        }
+
+        #endregion
     }
 }
