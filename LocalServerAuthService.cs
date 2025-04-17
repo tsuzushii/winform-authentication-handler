@@ -91,47 +91,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
-        private bool LaunchLowProfileBrowser(string url)
-        {
-            try
-            {
-                // Try Chrome-based browsers with minimized window settings
-                string browserPath = GetChromiumBasedBrowserPath();
-
-                if (!string.IsNullOrEmpty(browserPath))
-                {
-                    ProcessStartInfo psi = new ProcessStartInfo
-                    {
-                        FileName = browserPath,
-                        // Use a combination of flags to make the window as unobtrusive as possible
-                        Arguments = $"--new-window --app=\"{url}\" --window-size=1,1 --window-position=0,0",
-                        WindowStyle = ProcessWindowStyle.Minimized,
-                        UseShellExecute = true
-                    };
-
-                    _logMessage("Browser window will open briefly for authentication. It will close automatically.");
-                    _browserProcess = Process.Start(psi);
-                    return true;
-                }
-
-                // Fallback to default browser
-                _logMessage("Browser window will open briefly for authentication. It will close automatically.");
-                ProcessStartInfo defaultPsi = new ProcessStartInfo
-                {
-                    FileName = url,
-                    WindowStyle = ProcessWindowStyle.Minimized,
-                    UseShellExecute = true
-                };
-
-                _browserProcess = Process.Start(defaultPsi);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error launching browser: {ex.Message}");
-                return false;
-            }
-        }
         private void HandleListenerStartupError(HttpListenerException ex)
         {
             _logMessage($"Error starting HTTP listener: {ex.Message}");
