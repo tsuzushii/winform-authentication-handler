@@ -1,5 +1,4 @@
-﻿
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -14,7 +13,6 @@ using System.Threading.Tasks;
 using System.Web;
 using System.Windows.Forms;
 using Microsoft.Win32;
-using IdentityModel.Client;
 
 namespace WinForms_OAuth2ImplicitFlow_Prototype
 {
@@ -25,19 +23,14 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private const int FixedPort = 54321; // Fixed port - make sure this is whitelisted with your IDP
         private readonly Action<string> _statusCallback;
         private readonly bool _hideBrowser;
-        private TaskCompletionSource<Dictionary<string, string>> _authCompletionSource;
-        private CancellationTokenSource _cancellationTokenSource;
 
         public FixedPortAuthService(AuthConfig authConfig, Action<string> statusCallback = null, bool hideBrowser = false)
         {
             _authConfig = authConfig;
             _statusCallback = statusCallback ?? ((message) => { Debug.WriteLine(message); });
             _hideBrowser = hideBrowser;
-            _authCompletionSource = new TaskCompletionSource<Dictionary<string, string>>();
-            _cancellationTokenSource = new CancellationTokenSource();
         }
 
-        // Improved AuthenticateAsync method with proper task waiting
         public async Task<Dictionary<string, string>> AuthenticateAsync()
         {
             _statusCallback("Starting authentication process...");
@@ -118,49 +111,88 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     throw new InvalidOperationException("Failed to launch browser. Please check if a browser is installed.");
                 }
 
-                Debug.WriteLine("Browser launched, waiting for callback...");
-                _statusCallback("Waiting for authentication in browser...");
+                Debug.WriteLine("Browser launched");
 
-                // Create a cancellation token with timeout
+                // Create a cancellation token source for the timeout
                 using (var cts = new CancellationTokenSource(AuthenticationTimeoutMilliseconds))
                 {
+                    _statusCallback("Waiting for authentication in browser...");
+
+                    // Create a task that will complete when the HTTP request (redirect) is received
+                    Task<HttpListenerContext> httpContextTask;
+
                     try
                     {
-                        // Wait for the request with timeout
-                        var context = await GetCallbackWithTokenAsync(httpListener, state, cts.Token);
+                        httpContextTask = httpListener.GetContextAsync();
 
-                        // Extract the token
-                        _statusCallback("Processing authentication response...");
-                        string fragment = ExtractFragment(context);
+                        // Wait for either the HTTP context or cancellation
+                        await Task.WhenAny(httpContextTask, Task.Delay(Timeout.Infinite, cts.Token)).ConfigureAwait(false);
 
-                        // Send response to close browser
-                        await SendResponseAsync(context);
-
-                        if (string.IsNullOrEmpty(fragment))
+                        // Check if we timed out
+                        if (cts.Token.IsCancellationRequested && !httpContextTask.IsCompleted)
                         {
-                            _statusCallback("Error: No authentication token received.");
-                            throw new InvalidOperationException("No authentication token received. Please try again.");
+                            _statusCallback("Authentication timed out. Please try again.");
+                            throw new TimeoutException("Authentication timed out. Please try again.");
                         }
-
-                        // Parse the fragment
-                        var tokenDict = ParseFragment(fragment);
-
-                        // Check for access token
-                        if (!tokenDict.ContainsKey(MSAConstants.AccessTokenIdentifier))
-                        {
-                            _statusCallback("Error: No access token in response.");
-                            throw new InvalidOperationException("No access token received. Authentication failed.");
-                        }
-
-                        _statusCallback("Authentication successful!");
-                        Debug.WriteLine("Authentication successful");
-                        return tokenDict;
                     }
-                    catch (OperationCanceledException)
+                    catch (TaskCanceledException)
                     {
-                        _statusCallback("Authentication timed out.");
+                        _statusCallback("Authentication timed out. Please try again.");
                         throw new TimeoutException("Authentication timed out. Please try again.");
                     }
+
+                    // Get the HTTP context from the completed task
+                    _statusCallback("Processing authentication response...");
+                    var context = httpContextTask.Result;
+                    Debug.WriteLine("Received HTTP request: " + context.Request.Url);
+
+                    // Extract the token from various possible sources
+                    string fragment = ExtractFragment(context);
+
+                    // Send a response to the browser to close the window
+                    await SendResponseAsync(context);
+
+                    // Ensure we have a fragment
+                    if (string.IsNullOrEmpty(fragment))
+                    {
+                        _statusCallback("Error: No authentication token received.");
+                        Debug.WriteLine("No fragment found in the callback URL");
+                        throw new InvalidOperationException("No authentication token received. Please try again.");
+                    }
+
+                    // Parse the fragment to get the token
+                    var tokenDict = ParseFragment(fragment);
+
+                    // Check for error response
+                    if (tokenDict.ContainsKey("error"))
+                    {
+                        string errorDescription = tokenDict.ContainsKey("error_description")
+                            ? tokenDict["error_description"]
+                            : "Unknown error";
+
+                        _statusCallback($"Authentication error: {errorDescription}");
+                        throw new InvalidOperationException($"Authentication error: {errorDescription}");
+                    }
+
+                    // Validate state parameter to prevent CSRF
+                    if (!tokenDict.ContainsKey("state") || tokenDict["state"] != state)
+                    {
+                        _statusCallback("Error: Invalid state parameter.");
+                        Debug.WriteLine("State validation failed");
+                        throw new InvalidOperationException("Invalid state parameter. The authentication request may have been tampered with.");
+                    }
+
+                    // Check if we have an access token
+                    if (!tokenDict.ContainsKey(MSAConstants.AccessTokenIdentifier))
+                    {
+                        _statusCallback("Error: No access token received.");
+                        Debug.WriteLine("No access token in the response");
+                        throw new InvalidOperationException("No access token received. Authentication failed.");
+                    }
+
+                    _statusCallback("Authentication successful!");
+                    Debug.WriteLine("Authentication successful");
+                    return tokenDict;
                 }
             }
             finally
@@ -174,168 +206,68 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
-        // Helper method to get callback with token
-        private async Task<HttpListenerContext> GetCallbackWithTokenAsync(HttpListener listener, string expectedState, CancellationToken cancellationToken)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Create a task that will complete when a request is received
-                var contextTask = listener.GetContextAsync();
-
-                // Wait for either the context or cancellation
-                await Task.WhenAny(contextTask, Task.Delay(Timeout.Infinite, cancellationToken));
-
-                // If we were canceled, propagate the cancellation
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Get the context
-                var context = await contextTask;
-
-                // Check if this request contains valid state
-                string fragment = ExtractFragment(context);
-                if (!string.IsNullOrEmpty(fragment))
-                {
-                    var tokens = ParseFragment(fragment);
-                    if (tokens.ContainsKey("state") && tokens["state"] == expectedState)
-                    {
-                        // This is the callback we're looking for
-                        return context;
-                    }
-                }
-
-                // If we reach here, it wasn't the right request, so continue listening
-                await SendContinueResponseAsync(context);
-            }
-
-            throw new OperationCanceledException();
-        }
-
-        // Helper to send a response to invalid requests
-        private async Task SendContinueResponseAsync(HttpListenerContext context)
-        {
-            string responseHtml = @"
-        <!DOCTYPE html>
-        <html>
-        <head><title>Processing...</title></head>
-        <body><p>Processing authentication, please wait...</p></body>
-        </html>";
-
-            byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
-            context.Response.ContentLength64 = buffer.Length;
-            context.Response.ContentType = "text/html";
-
-            await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-            context.Response.OutputStream.Close();
-        }
-
-       
-
         private string ExtractFragment(HttpListenerContext context)
         {
-            // Enhanced fragment extraction to handle various scenarios
+            // Check multiple places where the fragment might be
 
-            // 1. Check the URL fragment directly
-            string fragment = context.Request.Url.Fragment;
-            if (!string.IsNullOrEmpty(fragment))
-            {
-                Debug.WriteLine("Found fragment in URL: " + fragment);
-                return fragment;
-            }
-
-            // 2. Check for special query parameters that might contain the fragment
+            // 1. First check if fragment is present in URL query (it may be passed as a query parameter)
+            string fragment = null;
             var query = context.Request.QueryString;
 
-            // Various ways browsers might encode the fragment
             if (query["fragment"] != null)
             {
                 fragment = "#" + query["fragment"];
                 Debug.WriteLine("Found fragment in 'fragment' query parameter: " + fragment);
-                return fragment;
             }
-
-            if (query["#"] != null)
+            else if (query["#"] != null)
             {
                 fragment = "#" + query["#"];
                 Debug.WriteLine("Found fragment in '#' query parameter: " + fragment);
-                return fragment;
             }
 
-            // 3. Check for access_token directly in query params
-            if (query["access_token"] != null)
+            // 2. Check for custom parameter that might contain the token directly
+            else if (query["access_token"] != null)
             {
-                var sb = new StringBuilder("#access_token=");
-                sb.Append(query["access_token"]);
+                fragment = "#access_token=" + query["access_token"];
 
-                // Add other standard OAuth parameters if present
+                // Add other parameters if they exist
                 if (query["token_type"] != null)
-                    sb.Append("&token_type=").Append(query["token_type"]);
+                    fragment += "&token_type=" + query["token_type"];
                 if (query["expires_in"] != null)
-                    sb.Append("&expires_in=").Append(query["expires_in"]);
+                    fragment += "&expires_in=" + query["expires_in"];
                 if (query["state"] != null)
-                    sb.Append("&state=").Append(query["state"]);
-                if (query["id_token"] != null)
-                    sb.Append("&id_token=").Append(query["id_token"]);
+                    fragment += "&state=" + query["state"];
 
-                fragment = sb.ToString();
-                Debug.WriteLine("Constructed fragment from query parameters: " + fragment);
-                return fragment;
+                Debug.WriteLine("Constructed fragment from query parameters");
             }
 
-            // 4. Check request headers for Referer which might contain the fragment
-            string referer = context.Request.Headers["Referer"];
-            if (!string.IsNullOrEmpty(referer))
+            // 3. Check if it's in the Referer header
+            else if (context.Request.Headers["Referer"] != null)
             {
-                try
+                string referer = context.Request.Headers["Referer"];
+                if (!string.IsNullOrEmpty(referer))
                 {
-                    var refererUri = new Uri(referer);
-                    if (!string.IsNullOrEmpty(refererUri.Fragment))
+                    try
                     {
-                        Debug.WriteLine("Found fragment in referer: " + refererUri.Fragment);
-                        return refererUri.Fragment;
+                        var refererUri = new Uri(referer);
+                        fragment = refererUri.Fragment;
+                        Debug.WriteLine("Found fragment in referer: " + fragment);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine("Error parsing referer URI: " + ex.Message);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine("Error parsing referer URI: " + ex.Message);
-                }
             }
 
-            // 5. Try to parse the raw URL to find a fragment anywhere
-            string rawUrl = context.Request.RawUrl;
-            if (!string.IsNullOrEmpty(rawUrl))
+            // 4. Check if it's in the URL fragment
+            if (string.IsNullOrEmpty(fragment))
             {
-                int hashIndex = rawUrl.IndexOf('#');
-                if (hashIndex >= 0)
-                {
-                    fragment = rawUrl.Substring(hashIndex);
-                    Debug.WriteLine("Found fragment in raw URL: " + fragment);
-                    return fragment;
-                }
+                fragment = context.Request.Url.Fragment;
+                Debug.WriteLine("Using fragment from URL: " + fragment);
             }
 
-            // 6. Check the post data if it's a POST request
-            if (context.Request.HttpMethod == "POST")
-            {
-                try
-                {
-                    using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
-                    {
-                        string body = reader.ReadToEnd();
-                        if (body.Contains("access_token="))
-                        {
-                            Debug.WriteLine("Found token in POST body: " + body);
-                            return "#" + body;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine("Error reading POST data: " + ex.Message);
-                }
-            }
-
-            Debug.WriteLine("No token found in the request");
-            return string.Empty;
+            return fragment;
         }
 
         private static async Task SendResponseAsync(HttpListenerContext context)
@@ -360,15 +292,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         <p>You have been successfully authenticated. You can close this window now.</p>
     </div>
     <script>
-        // Send the token back if it's in the URL hash
-        var hash = window.location.hash;
-        if (hash) {
-            // Try to pass the hash back to the server
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', '/callback?fragment=' + encodeURIComponent(hash.substring(1)), true);
-            xhr.send();
-        }
-        
         // Close the window automatically after 1 second
         setTimeout(function() {
             window.close();
@@ -410,12 +333,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
             }
 
-            Debug.WriteLine($"Parsed {result.Count} parameters from fragment");
-            foreach (var key in result.Keys)
-            {
-                Debug.WriteLine($"  {key}: {(key == "access_token" ? "[TOKEN]" : result[key])}");
-            }
-
             return result;
         }
 
@@ -433,8 +350,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                         FileName = edgePath,
                         Arguments = url,
                         WindowStyle = ProcessWindowStyle.Minimized,
-                        CreateNoWindow = false, // Must be false to allow window manipulation
-                        UseShellExecute = true  // Must be true to allow window manipulation
+                        CreateNoWindow = true,
+                        UseShellExecute = true
                     };
 
                     Process.Start(psi);
@@ -450,7 +367,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                         FileName = chromePath,
                         Arguments = url,
                         WindowStyle = ProcessWindowStyle.Minimized,
-                        CreateNoWindow = false,
+                        CreateNoWindow = true,
                         UseShellExecute = true
                     };
 
@@ -504,17 +421,22 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private static string GetEdgeBrowserExecutable()
         {
-            // Implementation unchanged
+            // Try to find Edge (Chromium-based) browser
             string[] possibleEdgePaths = new string[]
             {
+                // Edge stable channel
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
                     "Microsoft", "Edge", "Application", "msedge.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                     "Microsoft", "Edge", "Application", "msedge.exe"),
+                    
+                // Edge Beta channel
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
                     "Microsoft", "Edge Beta", "Application", "msedge.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                     "Microsoft", "Edge Beta", "Application", "msedge.exe"),
+                    
+                // Edge Dev channel
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
                     "Microsoft", "Edge Dev", "Application", "msedge.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
@@ -529,6 +451,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
             }
 
+            // Try to find from registry
             string regPath = Registry.GetValue(
                 "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
                 null,
@@ -545,7 +468,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private static string GetChromeBrowserExecutable()
         {
-            // Implementation unchanged
             string chromePath = Registry.GetValue(
                 "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
                 null,
@@ -566,7 +488,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private string GetAuthorizeUrlBasedOnEnvironment()
         {
-            // Implementation unchanged
             string environment = Fortis.FIBE.XN.Environment.SystemInfo.Current.SystemEnvironment;
             string authorizeUrl = "";
 
@@ -593,7 +514,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         public ClaimsPrincipal CreateClaimsPrincipal(Dictionary<string, string> tokenDict)
         {
-            // Implementation unchanged
             var claims = new List<Claim>();
 
             // Add all token information as claims

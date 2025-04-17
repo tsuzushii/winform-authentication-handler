@@ -1,5 +1,4 @@
-﻿
-using System;
+﻿using System;
 using System.Windows.Forms;
 
 namespace WinForms_OAuth2ImplicitFlow_Prototype
