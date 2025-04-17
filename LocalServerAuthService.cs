@@ -1,4 +1,5 @@
-﻿using System;
+﻿
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -32,6 +33,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private WebBrowser _hiddenBrowser;
         private CancellationTokenSource _minimizerCts;
         private Form _progressForm;
+        private bool _isAuthenticationSuccessful = false;
+        private bool _isProcessingFragment = false;
 
         // Win32 API for window manipulation
         [DllImport("user32.dll")]
@@ -73,6 +76,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         {
             _logMessage("Starting authentication process...");
             Debug.WriteLine("Starting fixed port authentication");
+            _isAuthenticationSuccessful = false;
+            _isProcessingFragment = false;
 
             // Show the progress form
             ShowProgressForm();
@@ -111,11 +116,21 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     //Return the token dictionary
                     return _fragmentReceived.Task.Result;
                 }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Authentication exception: {ex.Message}");
+                    throw;
+                }
                 finally
                 {
                     //Clean up
                     CleanupResources(httpListener);
-                    CloseProgressForm();
+
+                    // Only close progress form if it wasn't already closed during success processing
+                    if (!_isAuthenticationSuccessful)
+                    {
+                        CloseProgressForm();
+                    }
                 }
             }
         }
@@ -162,6 +177,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             return url;
         }
 
+
         private async Task LaunchBrowserAndListenForCallback(string authUrl, HttpListener httpListener)
         {
             _logMessage("Launching browser...");
@@ -199,7 +215,13 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     ValidateAuthenticationResponse(tokenDict);
 
                     _logMessage("Authentication successful!");
+                    _isAuthenticationSuccessful = true;
                     UpdateProgressStatus("Authentication successful!");
+
+                    // Add a small delay to make sure the browser has time to process the success page
+                    await Task.Delay(1000);
+
+                    // Now terminate the browser
                     TerminateBrowserProcess();
                 }
                 catch (TimeoutException)
@@ -218,6 +240,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
             }
         }
+
 
         private Task StartListenerTask(HttpListener httpListener)
         {
@@ -317,6 +340,16 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
                 else if (path.StartsWith("/fragment"))
                 {
+                    // Prevent multiple fragment processing
+                    if (_isProcessingFragment)
+                    {
+                        Debug.WriteLine("Ignoring duplicate fragment processing request");
+                        await SendFragmentProcessedResponseAsync(context);
+                        return;
+                    }
+
+                    _isProcessingFragment = true;
+
                     if (context.Request.HttpMethod == "POST")
                     {
                         // Handle POST requests from the form
@@ -352,58 +385,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
-        private async Task ProcessFragmentPostDataAsync(HttpListenerContext context)
+        private async Task SendFragmentProcessedResponseAsync(HttpListenerContext context)
         {
-            try
-            {
-                // Read POST data
-                string fragmentData = "";
-                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
-                {
-                    string formData = await reader.ReadToEndAsync();
-                    Debug.WriteLine($"Received POST fragment data: {formData}");
-
-                    // Extract the fragment parameter
-                    var formParts = formData.Split('&');
-                    foreach (var part in formParts)
-                    {
-                        var keyValue = part.Split(new[] { '=' }, 2);
-                        if (keyValue.Length == 2 && keyValue[0] == "fragment")
-                        {
-                            fragmentData = HttpUtility.UrlDecode(keyValue[1]);
-                            break;
-                        }
-                    }
-                }
-
-                if (!string.IsNullOrEmpty(fragmentData))
-                {
-                    // Parse the query parameters
-                    Dictionary<string, string> parsedData = ParseQueryString(fragmentData);
-
-                    // Signal that we've received the fragment data
-                    if (parsedData.Count > 0)
-                    {
-                        _fragmentReceived.TrySetResult(parsedData);
-                        Debug.WriteLine("Successfully parsed and processed fragment data");
-                        UpdateProgressStatus("Authentication data received");
-                    }
-                    else
-                    {
-                        _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
-                        Debug.WriteLine("Empty fragment data received");
-                        UpdateProgressStatus("Error: Empty authentication data");
-                    }
-                }
-                else
-                {
-                    _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
-                    Debug.WriteLine("No fragment data received");
-                    UpdateProgressStatus("Error: No authentication data received");
-                }
-
-                // Send a clear success response
-                string responseHtml = @"
+            string responseHtml = @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -447,13 +431,70 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 </body>
 </html>";
 
-                byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
-                context.Response.ContentLength64 = buffer.Length;
-                context.Response.ContentType = "text/html";
-                context.Response.StatusCode = 200;
+            byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
+            context.Response.ContentLength64 = buffer.Length;
+            context.Response.ContentType = "text/html";
+            context.Response.StatusCode = 200;
 
-                await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                context.Response.OutputStream.Close();
+            await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            context.Response.OutputStream.Close();
+        }
+
+        private async Task ProcessFragmentPostDataAsync(HttpListenerContext context)
+        {
+            try
+            {
+                // Read POST data
+                string fragmentData = "";
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
+                {
+                    string formData = await reader.ReadToEndAsync();
+                    Debug.WriteLine($"Received POST fragment data: {formData}");
+
+                    // Extract the fragment parameter
+                    var formParts = formData.Split('&');
+                    foreach (var part in formParts)
+                    {
+                        var keyValue = part.Split(new[] { '=' }, 2);
+                        if (keyValue.Length == 2 && keyValue[0] == "fragment")
+                        {
+                            fragmentData = HttpUtility.UrlDecode(keyValue[1]);
+                            break;
+                        }
+                    }
+                }
+
+                bool fragmentProcessed = false;
+
+                if (!string.IsNullOrEmpty(fragmentData))
+                {
+                    // Parse the query parameters
+                    Dictionary<string, string> parsedData = ParseQueryString(fragmentData);
+
+                    // Signal that we've received the fragment data
+                    if (parsedData.Count > 0)
+                    {
+                        fragmentProcessed = _fragmentReceived.TrySetResult(parsedData);
+                        Debug.WriteLine($"Successfully parsed and processed fragment data: {fragmentProcessed}");
+                        _isAuthenticationSuccessful = true;
+                        UpdateProgressStatus("Authentication data received");
+                    }
+                    else
+                    {
+                        fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
+                        Debug.WriteLine($"Empty fragment data received: {fragmentProcessed}");
+                        UpdateProgressStatus("Error: Empty authentication data");
+                    }
+                }
+                else
+                {
+                    fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
+                    Debug.WriteLine($"No fragment data received: {fragmentProcessed}");
+                    UpdateProgressStatus("Error: No authentication data received");
+                }
+
+                // Send a clear success response
+                await SendFragmentProcessedResponseAsync(context);
                 Debug.WriteLine("Fragment data processing complete with success response");
             }
             catch (Exception ex)
@@ -555,10 +596,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     // Submit the form
                     form.submit();
                     
-                    // Auto-close window after a delay
-                    setTimeout(function() {
-                        window.close();
-                    }, 1500);
+                    // Don't auto-close here, let the response page handle it
                 } catch(e) {
                     console.error('Error sending data:', e);
                     document.getElementById('spinner').style.display = 'none';
@@ -600,6 +638,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 Debug.WriteLine($"Received fragment data: {query}");
 
                 Dictionary<string, string> fragmentData = null;
+                bool fragmentProcessed = false;
 
                 if (!string.IsNullOrEmpty(query) && query.Length > 1)
                 {
@@ -612,72 +651,24 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     // Signal that we've received the fragment data
                     if (fragmentData.Count > 0)
                     {
-                        _fragmentReceived.TrySetResult(fragmentData);
+                        fragmentProcessed = _fragmentReceived.TrySetResult(fragmentData);
+                        Debug.WriteLine($"Fragment processing success: {fragmentProcessed}");
+                        _isAuthenticationSuccessful = true;
                     }
                     else
                     {
-                        _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
+                        fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
                         Debug.WriteLine("Empty fragment data received");
                     }
                 }
                 else
                 {
-                    _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
+                    fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
                     Debug.WriteLine("No fragment data received");
                 }
 
                 // Send a clear success response
-                string responseHtml = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Authentication Complete</title>
-    <style>
-        body { 
-            font-family: 'Segoe UI', Arial, sans-serif; 
-            background-color: #f0f0f0; 
-            text-align: center; 
-            margin: 0; 
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-        }
-        .container { 
-            background-color: white; 
-            max-width: 500px; 
-            padding: 30px; 
-            border-radius: 8px; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        }
-        .success {
-            color: #107C10;
-            font-weight: bold;
-        }
-    </style>
-    <script>
-        window.onload = function() {
-            setTimeout(function() {
-                window.close();
-            }, 2000);
-        };
-    </script>
-</head>
-<body>
-    <div class='container'>
-        <p class='success'>Authentication successful!</p>
-        <p>You can close this window now.</p>
-    </div>
-</body>
-</html>";
-
-                byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
-                context.Response.ContentLength64 = buffer.Length;
-                context.Response.ContentType = "text/html";
-                context.Response.StatusCode = 200;
-
-                await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                context.Response.OutputStream.Close();
+                await SendFragmentProcessedResponseAsync(context);
                 Debug.WriteLine("Fragment data processing complete with success response");
             }
             catch (Exception ex)
@@ -866,26 +857,192 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
+
+
         private void TerminateBrowserProcess()
         {
             // Stop the minimizer thread
             StopMinimizeThread();
 
-            // Now terminate the browser
+            // Store the browser process information first since we might lose access to it
+            string processName = "unknown";
+            int processId = -1;
+
             try
             {
-                if (_browserProcess != null && !_browserProcess.HasExited)
+                if (_browserProcess != null)
                 {
-                    _browserProcess.Kill();
-                    _browserProcess.Dispose();
+                    // Capture process info before trying to access it further
+                    processName = _browserProcess.ProcessName;
+                    processId = _browserProcess.Id;
+
+                    Debug.WriteLine($"Preparing to terminate browser: Process name={processName}, ID={processId}");
+
+                    try
+                    {
+                        // Check if process is already exited
+                        if (!_browserProcess.HasExited)
+                        {
+                            _browserProcess.Kill();
+                            Debug.WriteLine("Browser process kill command sent");
+                        }
+                        else
+                        {
+                            Debug.WriteLine("Browser process has already exited");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Error during kill operation: {ex.Message}");
+                    }
+
+                    // Always dispose of the process object regardless of whether kill worked
+                    try
+                    {
+                        _browserProcess.Dispose();
+                    }
+                    catch { }
+
                     _browserProcess = null;
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error terminating browser: {ex.Message}");
+                Debug.WriteLine($"Error accessing browser process: {ex.Message}");
             }
+
+            // After attempting to kill the main process, ensure browser windows are closed
+            // by using a direct system command (works even if Process object is invalid)
+            if (processName.Contains("edge") || processName.Contains("Edge"))
+            {
+                try
+                {
+                    Debug.WriteLine("Using taskkill to terminate Edge browser");
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "taskkill",
+                        Arguments = "/F /IM msedge.exe",
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    })?.WaitForExit(2000);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Taskkill for Edge failed: {ex.Message}");
+                }
+            }
+            else if (processName.Contains("chrome") || processName.Contains("Chrome"))
+            {
+                try
+                {
+                    Debug.WriteLine("Using taskkill to terminate Chrome browser");
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "taskkill",
+                        Arguments = "/F /IM chrome.exe",
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    })?.WaitForExit(2000);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Taskkill for Chrome failed: {ex.Message}");
+                }
+            }
+            else
+            {
+                // If we couldn't determine the browser type, try killing both
+                try
+                {
+                    Debug.WriteLine("Browser type unknown, killing both Edge and Chrome");
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "taskkill",
+                        Arguments = "/F /IM msedge.exe",
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    })?.WaitForExit(1000);
+
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "taskkill",
+                        Arguments = "/F /IM chrome.exe",
+                        CreateNoWindow = true,
+                        UseShellExecute = false
+                    })?.WaitForExit(1000);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Taskkill for browsers failed: {ex.Message}");
+                }
+            }
+
+            // Final cleanup - make sure browser process variable is null
+            _browserProcess = null;
+            Debug.WriteLine("Browser termination completed");
         }
+
+        // Also update the LaunchHiddenBrowser method to use more reliable flags
+        //private bool LaunchHiddenBrowser(string url)
+        //{
+        //    try
+        //    {
+        //        // Stop any existing minimizer
+        //        StopMinimizeThread();
+
+        //        // Get browser path - try Edge first (usually more reliable)
+        //        string browserPath = GetEdgeBrowserExecutable();
+        //        if (string.IsNullOrEmpty(browserPath))
+        //        {
+        //            browserPath = GetChromeBrowserExecutable();
+        //        }
+
+        //        _logMessage("Launching browser with minimal window...");
+        //        UpdateProgressStatus("Launching browser...");
+
+        //        if (!string.IsNullOrEmpty(browserPath))
+        //        {
+        //            // For Chrome/Edge, a combination of flags that work well
+        //            ProcessStartInfo psi = new ProcessStartInfo
+        //            {
+        //                FileName = browserPath,
+        //                // Use single-process mode to make termination more reliable
+        //                Arguments = $"--new-window --no-first-run --noerrdialogs --disable-background-networking --start-minimized \"{url}\"",
+        //                WindowStyle = ProcessWindowStyle.Minimized,
+        //                UseShellExecute = true
+        //            };
+
+        //            _browserProcess = Process.Start(psi);
+        //            _logMessage($"Browser process started with ID: {_browserProcess?.Id}, Name: {_browserProcess?.ProcessName}");
+        //        }
+        //        else
+        //        {
+        //            // Fallback to default browser
+        //            _logMessage("Using default browser...");
+        //            ProcessStartInfo psi = new ProcessStartInfo
+        //            {
+        //                FileName = url,
+        //                WindowStyle = ProcessWindowStyle.Minimized,
+        //                UseShellExecute = true
+        //            };
+
+        //            _browserProcess = Process.Start(psi);
+        //        }
+
+        //        // Start the minimizer thread to continuously keep the browser minimized
+        //        StartMinimizeThread();
+
+        //        return true;
+        //    }
+        //    catch (Exception ex)
+        //    {
+        //        _logMessage($"Error launching browser: {ex.Message}");
+        //        Debug.WriteLine($"Launch browser error: {ex.Message}");
+        //        return false;
+        //    }
+        //}
+
+
 
         private static string GetEdgeBrowserExecutable()
         {
@@ -1042,214 +1199,20 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private void ShowProgressForm()
         {
-            try
-            {
-                // Create progress form on UI thread
-                if (Application.OpenForms.Count > 0)
-                {
-                    Application.OpenForms[0].Invoke((MethodInvoker)delegate
-                    {
-                        _progressForm = CreateProgressForm();
-                        _progressForm.Show();
-                        _progressForm.BringToFront();
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error creating progress form: {ex.Message}");
-            }
-        }
-
-        private Form CreateProgressForm()
-        {
-            var form = new Form
-            {
-                Text = "Authentication",
-                Width = 450,
-                Height = 280,
-                FormBorderStyle = FormBorderStyle.FixedDialog,
-                StartPosition = FormStartPosition.CenterScreen,
-                MaximizeBox = false,
-                MinimizeBox = false,
-                ControlBox = true,
-                ShowIcon = true,
-                BackColor = Color.White
-            };
-
-            // Add a logo at the top
-            var logoPanel = new Panel
-            {
-                BackColor = Color.FromArgb(0, 120, 212), // Microsoft Blue
-                Height = 70,
-                Dock = DockStyle.Top
-            };
-
-            var logoLabel = new Label
-            {
-                Text = "🔒",
-                Font = new Font("Segoe UI", 26, FontStyle.Regular),
-                ForeColor = Color.White,
-                AutoSize = true,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Location = new Point(20, 12)
-            };
-            logoPanel.Controls.Add(logoLabel);
-
-            var headerLabel = new Label
-            {
-                Text = "Secure Authentication",
-                Font = new Font("Segoe UI Semibold", 15, FontStyle.Regular),
-                ForeColor = Color.White,
-                AutoSize = true,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Location = new Point(70, 20)
-            };
-            logoPanel.Controls.Add(headerLabel);
-
-            form.Controls.Add(logoPanel);
-
-            // Add title and instructions
-            var titleLabel = new Label
-            {
-                Text = "Authenticating your account",
-                Font = new Font("Segoe UI Semibold", 14, FontStyle.Regular),
-                AutoSize = true,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Location = new Point(30, 90)
-            };
-            form.Controls.Add(titleLabel);
-
-            var instructionsLabel = new Label
-            {
-                Text = "Please wait while we authenticate your account with Microsoft. This process is handled automatically in the background.",
-                Font = new Font("Segoe UI", 9, FontStyle.Regular),
-                AutoSize = false,
-                Width = 390,
-                Height = 40,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Location = new Point(30, 120)
-            };
-            form.Controls.Add(instructionsLabel);
-
-            // Add a status label
-            var statusLabel = new Label
-            {
-                Text = "Initializing authentication...",
-                Font = new Font("Segoe UI", 9, FontStyle.Regular),
-                AutoSize = false,
-                Width = 390,
-                Height = 20,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Location = new Point(30, 165),
-                Tag = "status" // We'll use this tag to find the label later
-            };
-            form.Controls.Add(statusLabel);
-
-            // Add a progress bar
-            var progressBar = new ProgressBar
-            {
-                Style = ProgressBarStyle.Marquee,
-                MarqueeAnimationSpeed = 30,
-                Height = 5,
-                Width = 390,
-                Location = new Point(30, 190)
-            };
-            form.Controls.Add(progressBar);
-
-            // Add a cancel button
-            var cancelButton = new Button
-            {
-                Text = "Cancel",
-                Width = 100,
-                Height = 30,
-                Location = new Point(320, 210),
-                UseVisualStyleBackColor = true
-            };
-            cancelButton.Click += (sender, e) =>
-            {
-                form.Close();
-                AuthenticationManager.RaiseTokenFailed("Authentication was canceled by the user.");
-            };
-            form.Controls.Add(cancelButton);
-
-            // Handle form closing
-            form.FormClosing += (sender, e) =>
-            {
-                if (e.CloseReason == CloseReason.UserClosing)
-                {
-                    Debug.WriteLine("User canceled authentication");
-                    AuthenticationManager.RaiseTokenFailed("Authentication was canceled by the user.");
-                }
-            };
-
-            return form;
+            // Don't create a progress form here - let AuthenticationManager handle it
+            _logMessage("Progress tracking is handled by AuthenticationManager");
         }
 
         private void UpdateProgressStatus(string status)
         {
-            if (_progressForm != null)
-            {
-                try
-                {
-                    if (_progressForm.InvokeRequired)
-                    {
-                        _progressForm.Invoke((MethodInvoker)delegate {
-                            if (!_progressForm.IsDisposed)
-                            {
-                                var statusLabel = _progressForm.Controls.Find("status", true);
-                                if (statusLabel.Length > 0 && statusLabel[0] is Label)
-                                {
-                                    ((Label)statusLabel[0]).Text = status;
-                                }
-                            }
-                        });
-                    }
-                    else if (!_progressForm.IsDisposed)
-                    {
-                        var statusLabel = _progressForm.Controls.Find("status", true);
-                        if (statusLabel.Length > 0 && statusLabel[0] is Label)
-                        {
-                            ((Label)statusLabel[0]).Text = status;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error updating status: {ex.Message}");
-                }
-            }
+            // Forward status updates to the log message handler
+            _logMessage(status);
         }
 
         private void CloseProgressForm()
         {
-            if (_progressForm != null)
-            {
-                try
-                {
-                    if (_progressForm.InvokeRequired)
-                    {
-                        _progressForm.Invoke((MethodInvoker)delegate {
-                            if (!_progressForm.IsDisposed)
-                            {
-                                _progressForm.Close();
-                                _progressForm.Dispose();
-                                _progressForm = null;
-                            }
-                        });
-                    }
-                    else if (!_progressForm.IsDisposed)
-                    {
-                        _progressForm.Close();
-                        _progressForm.Dispose();
-                        _progressForm = null;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error closing progress form: {ex.Message}");
-                }
-            }
+            // Don't close the progress form - let AuthenticationManager handle it
+            _logMessage("Progress form will be closed by AuthenticationManager");
         }
 
         #endregion

@@ -18,6 +18,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private static SynchronizationContext _uiContext;
         private static bool _hideBrowser = true; // Set to true to hide the browser window
         private static bool _useCustomProgressIndicator = true; // Set to true to use our custom progress indicator
+        private static Form _progressForm = null; // Keep a static reference to the progress form
 
         public static event EventHandler<TokenReceivedEventArgs> TokenReceived;
         public static event EventHandler<string> TokenFailed;
@@ -45,22 +46,52 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         public static void Initialize(AuthConfig config)
         {
             Debug.WriteLine("AuthenticationManager.Initialize() called");
-            _uiContext = SynchronizationContext.Current ?? new SynchronizationContext();
 
-            Form progressForm = null;
+            // Ensure any existing progress form is closed and disposed
+            CloseProgressForm();
+
+            _uiContext = SynchronizationContext.Current ?? new SynchronizationContext();
 
             if (_useCustomProgressIndicator && Application.OpenForms.Count > 0)
             {
                 try
                 {
-                    // Create controls on the UI thread
-                    Application.OpenForms[0].Invoke((MethodInvoker)delegate
+                    // Create the progress form on the UI thread
+                    var mainForm = Application.OpenForms[0];
+                    if (mainForm != null && !mainForm.IsDisposed)
                     {
-                        // Create a nicer progress form
-                        progressForm = CreateProgressForm();
-                        progressForm.Show();
-                        progressForm.BringToFront();
-                    });
+                        if (mainForm.InvokeRequired)
+                        {
+                            mainForm.Invoke((MethodInvoker)delegate
+                            {
+                                try
+                                {
+                                    Debug.WriteLine("Creating progress form on UI thread");
+                                    _progressForm = CreateProgressForm();
+                                    _progressForm.Show();
+                                    _progressForm.BringToFront();
+                                    _progressForm.Update();
+                                    Debug.WriteLine("Progress form created and shown");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine("Error creating progress form from invoke: " + ex.Message);
+                                }
+                            });
+                        }
+                        else
+                        {
+                            Debug.WriteLine("Creating progress form directly");
+                            _progressForm = CreateProgressForm();
+                            _progressForm.Show();
+                            _progressForm.BringToFront();
+                            _progressForm.Update();
+                            Debug.WriteLine("Progress form created and shown directly");
+                        }
+
+                        // Process Windows messages to ensure form is displayed
+                        Application.DoEvents();
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -68,30 +99,42 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     _useCustomProgressIndicator = false;
                 }
             }
+            else
+            {
+                Debug.WriteLine("Not showing progress indicator: UseCustomIndicator=" + _useCustomProgressIndicator +
+                               ", OpenForms.Count=" + Application.OpenForms.Count);
+            }
 
             // Start authentication in background thread
             Task.Run(async () =>
             {
                 try
                 {
-                    UpdateProgressStatus(progressForm, "Starting authentication process...");
+                    UpdateProgressStatus("Starting authentication process...");
 
                     // Create and use the fixed port authentication service
                     var authService = new FixedPortAuthService(
                         config,
-                        (status) => UpdateProgressStatus(progressForm, status),
+                        (status) => UpdateProgressStatus(status),
                         _hideBrowser);
 
                     var tokenDict = await authService.AuthenticateAsync();
-
-                    // Close the progress form on the UI thread
-                    CloseProgressForm(progressForm);
 
                     // Process successful authentication
                     if (tokenDict != null && tokenDict.ContainsKey(MSAConstants.AccessTokenIdentifier))
                     {
                         Debug.WriteLine("Authentication successful, creating claims principal");
                         OidcAuthenticatedClaimsPrincipal = authService.CreateClaimsPrincipal(tokenDict);
+
+                        // Update status before closing
+                        UpdateProgressStatus("Authentication successful!");
+
+                        // Give UI time to update
+                        await Task.Delay(1000);
+
+                        // Close the progress form
+                        CloseProgressForm();
+
                         RaiseTokenReceived(tokenDict[MSAConstants.AccessTokenIdentifier], OidcAuthenticatedClaimsPrincipal);
 
                         // Setup token refresh
@@ -100,6 +143,12 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     else
                     {
                         Debug.WriteLine("Authentication failed - no token dictionary or no access token");
+                        UpdateProgressStatus("Authentication failed - no access token");
+
+                        // Give UI time to update
+                        await Task.Delay(1000);
+
+                        CloseProgressForm();
                         RaiseTokenFailed("Failed to obtain access token");
                         ShowErrorMessage("Authentication Failed", "Failed to obtain access token");
                     }
@@ -107,10 +156,12 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 catch (Exception ex)
                 {
                     Debug.WriteLine("Authentication exception: " + ex.Message);
+                    UpdateProgressStatus("Authentication error: " + ex.Message);
 
-                    // Close the progress form on the UI thread
-                    CloseProgressForm(progressForm);
+                    // Give UI time to update
+                    await Task.Delay(1000);
 
+                    CloseProgressForm();
                     RaiseTokenFailed("Authentication failed: " + ex.Message);
                     ShowErrorMessage("Authentication Error", "Authentication failed: " + ex.Message);
                 }
@@ -130,7 +181,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 MinimizeBox = false,
                 ControlBox = true,
                 ShowIcon = true,
-                BackColor = Color.White
+                BackColor = Color.White,
+                TopMost = true // Make sure it stays on top
             };
 
             // Add a logo or icon at the top
@@ -212,33 +264,42 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             return form;
         }
 
-        private static void UpdateProgressStatus(Form progressForm, string status)
+        private static void UpdateProgressStatus(string status)
         {
             Debug.WriteLine("Status update: " + status);
 
-            if (progressForm != null)
+            if (_progressForm != null)
             {
                 try
                 {
-                    if (progressForm.InvokeRequired)
+                    if (_progressForm.InvokeRequired)
                     {
-                        progressForm.Invoke((MethodInvoker)delegate {
-                            if (!progressForm.IsDisposed)
+                        _progressForm.Invoke((MethodInvoker)delegate {
+                            try
                             {
-                                var statusLabel = progressForm.Controls.Find("status", true);
-                                if (statusLabel.Length > 0 && statusLabel[0] is Label)
+                                if (!_progressForm.IsDisposed)
                                 {
-                                    ((Label)statusLabel[0]).Text = status;
+                                    var statusLabel = _progressForm.Controls.Find("status", true);
+                                    if (statusLabel.Length > 0 && statusLabel[0] is Label)
+                                    {
+                                        ((Label)statusLabel[0]).Text = status;
+                                        _progressForm.Update(); // Force immediate UI update
+                                    }
                                 }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine("Error updating status inner: " + ex.Message);
                             }
                         });
                     }
-                    else if (!progressForm.IsDisposed)
+                    else if (!_progressForm.IsDisposed)
                     {
-                        var statusLabel = progressForm.Controls.Find("status", true);
+                        var statusLabel = _progressForm.Controls.Find("status", true);
                         if (statusLabel.Length > 0 && statusLabel[0] is Label)
                         {
                             ((Label)statusLabel[0]).Text = status;
+                            _progressForm.Update(); // Force immediate UI update
                         }
                     }
                 }
@@ -247,28 +308,46 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     Debug.WriteLine("Error updating status: " + ex.Message);
                 }
             }
+            else
+            {
+                Debug.WriteLine("Progress form is null when trying to update status");
+            }
         }
 
-        private static void CloseProgressForm(Form progressForm)
+        private static void CloseProgressForm()
         {
-            if (progressForm != null)
+            if (_progressForm != null)
             {
                 try
                 {
-                    if (progressForm.InvokeRequired)
+                    Form formToClose = _progressForm;
+                    _progressForm = null; // Clear the reference first
+
+                    if (formToClose.InvokeRequired)
                     {
-                        progressForm.Invoke((MethodInvoker)delegate {
-                            if (!progressForm.IsDisposed)
+                        formToClose.Invoke((MethodInvoker)delegate {
+                            try
                             {
-                                progressForm.Close();
-                                progressForm.Dispose();
+                                if (!formToClose.IsDisposed)
+                                {
+                                    Debug.WriteLine("Closing progress form via invoke");
+                                    formToClose.Hide();
+                                    formToClose.Close();
+                                    formToClose.Dispose();
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine("Error closing progress form inner: " + ex.Message);
                             }
                         });
                     }
-                    else if (!progressForm.IsDisposed)
+                    else if (!formToClose.IsDisposed)
                     {
-                        progressForm.Close();
-                        progressForm.Dispose();
+                        Debug.WriteLine("Closing progress form directly");
+                        formToClose.Hide();
+                        formToClose.Close();
+                        formToClose.Dispose();
                     }
                 }
                 catch (Exception ex)
@@ -301,6 +380,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private static void InitializeRefreshTokenTimer(AuthConfig config)
         {
+            // Rest of the method stays the same...
             Debug.WriteLine("Setting up token refresh timer");
 
             // Stop and release the previous timer if it exists
@@ -354,6 +434,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private static DateTime GetTokenExpiryTime()
         {
+            // Method implementation remains the same...
             if (OidcAuthenticatedClaimsPrincipal == null)
             {
                 Debug.WriteLine("No authenticated principal, using default expiry time");
