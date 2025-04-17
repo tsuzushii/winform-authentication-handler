@@ -44,53 +44,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         /// Authenticates the user using OAuth2 Implicit Flow
         /// </summary>
         /// <returns>Dictionary containing authentication tokens</returns>
-        //public async Task<Dictionary<string, string>> AuthenticateAsync()
-        //{
-        //    _logMessage("Starting authentication process...");
-        //    Debug.WriteLine("Starting fixed port authentication");
-
-        //    _fragmentReceived = new TaskCompletionSource<Dictionary<string, string>>();
-
-        //    // Create a fixed redirect URI using the specified port
-        //    string redirectUri = $"http://localhost:{FixedPort}/callback";
-        //    Debug.WriteLine($"Redirect URI: {redirectUri}");
-
-        //    using (var httpListener = new HttpListener())
-        //    {
-        //        try
-        //        {
-        //            // Set up the HTTP listener for capturing the redirect
-        //            httpListener.Prefixes.Add($"http://localhost:{FixedPort}/callback/");
-        //            httpListener.Prefixes.Add($"http://localhost:{FixedPort}/fragment/");
-
-        //            try
-        //            {
-        //                httpListener.Start();
-        //                _logMessage("Listener started successfully");
-        //            }
-        //            catch (HttpListenerException ex)
-        //            {
-        //                HandleListenerStartupError(ex);
-        //            }
-
-        //            // Create the authentication URL
-        //            string authUrl = BuildAuthorizationUrl(redirectUri);
-
-        //            // Launch browser and start HTTP listener
-        //            await LaunchBrowserAndListenForCallback(authUrl, httpListener);
-
-        //            // Return the token dictionary
-        //            return _fragmentReceived.Task.Result;
-        //        }
-        //        finally
-        //        {
-        //            // Clean up
-        //            CleanupResources(httpListener);
-        //        }
-        //    }
-        //}
-
-
         public async Task<Dictionary<string, string>> AuthenticateAsync()
         {
             _logMessage("Starting authentication process...");
@@ -98,78 +51,41 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
             _fragmentReceived = new TaskCompletionSource<Dictionary<string, string>>();
 
-            // Create a fixed redirect URI using the specified port
+            //Create a fixed redirect URI using the specified port
             string redirectUri = $"http://localhost:{FixedPort}/callback";
+            Debug.WriteLine($"Redirect URI: {redirectUri}");
 
             using (var httpListener = new HttpListener())
             {
                 try
                 {
-                    // Set up and start the listener
+                    //Set up the HTTP listener for capturing the redirect
+
                     httpListener.Prefixes.Add($"http://localhost:{FixedPort}/callback/");
                     httpListener.Prefixes.Add($"http://localhost:{FixedPort}/fragment/");
 
                     try
                     {
                         httpListener.Start();
-                        _logMessage("Waiting for authentication...");
+                        _logMessage("Listener started successfully");
                     }
                     catch (HttpListenerException ex)
                     {
                         HandleListenerStartupError(ex);
                     }
 
-                    // Create the authentication URL
+                    //Create the authentication URL
                     string authUrl = BuildAuthorizationUrl(redirectUri);
 
-                    // Launch browser with warning to user
-                    _logMessage("A browser window will open briefly to complete authentication.");
-                    if (!LaunchLowProfileBrowser(authUrl))
-                    {
-                        _logMessage("Error: Failed to launch browser.");
-                        throw new InvalidOperationException("Failed to launch browser. Please check if a browser is installed.");
-                    }
+                    //Launch browser and start HTTP listener
+                    await LaunchBrowserAndListenForCallback(authUrl, httpListener);
 
-                    // Start listening in background
-                    var listenerTask = StartListenerTask(httpListener);
-
-                    // Wait for authentication with timeout
-                    using (var cts = new CancellationTokenSource(AuthenticationTimeoutMilliseconds))
-                    {
-                        try
-                        {
-                            var timeoutTask = Task.Delay(AuthenticationTimeoutMilliseconds, cts.Token);
-                            var completedTask = await Task.WhenAny(_fragmentReceived.Task, timeoutTask);
-
-                            if (completedTask == timeoutTask)
-                            {
-                                throw new TimeoutException("Authentication timed out. Please try again.");
-                            }
-
-                            // Get and validate token data
-                            var tokenDict = await _fragmentReceived.Task;
-                            ValidateAuthenticationResponse(tokenDict);
-
-                            _logMessage("Authentication successful!");
-                            TerminateBrowserProcess();
-                            return tokenDict;
-                        }
-                        catch (TimeoutException)
-                        {
-                            _logMessage("Authentication timed out. Please try again.");
-                            TerminateBrowserProcess();
-                            throw;
-                        }
-                        catch (Exception ex)
-                        {
-                            _logMessage($"Authentication error: {ex.Message}");
-                            TerminateBrowserProcess();
-                            throw;
-                        }
-                    }
+                    //Return the token dictionary
+                    return _fragmentReceived.Task.Result;
                 }
                 finally
                 {
+                    //Clean up
                     CleanupResources(httpListener);
                 }
             }
@@ -231,7 +147,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 throw new InvalidOperationException(
                     $"Port {FixedPort} is already in use. Close any other applications that might be using this port and try again.",
                     ex);
-            } else
+            }
+            else
             {
                 Debug.WriteLine("Issues with HTTP listener");
             }
@@ -438,54 +355,54 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
         private async Task ProcessFragmentPostDataAsync(HttpListenerContext context)
-{
-    try
-    {
-        // Read POST data
-        string fragmentData = "";
-        using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
         {
-            string formData = await reader.ReadToEndAsync();
-            Debug.WriteLine($"Received POST fragment data: {formData}");
-            
-            // Extract the fragment parameter
-            var formParts = formData.Split('&');
-            foreach (var part in formParts)
+            try
             {
-                var keyValue = part.Split(new[] { '=' }, 2);
-                if (keyValue.Length == 2 && keyValue[0] == "fragment")
+                // Read POST data
+                string fragmentData = "";
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
                 {
-                    fragmentData = HttpUtility.UrlDecode(keyValue[1]);
-                    break;
+                    string formData = await reader.ReadToEndAsync();
+                    Debug.WriteLine($"Received POST fragment data: {formData}");
+
+                    // Extract the fragment parameter
+                    var formParts = formData.Split('&');
+                    foreach (var part in formParts)
+                    {
+                        var keyValue = part.Split(new[] { '=' }, 2);
+                        if (keyValue.Length == 2 && keyValue[0] == "fragment")
+                        {
+                            fragmentData = HttpUtility.UrlDecode(keyValue[1]);
+                            break;
+                        }
+                    }
                 }
-            }
-        }
 
-        if (!string.IsNullOrEmpty(fragmentData))
-        {
-            // Parse the query parameters
-            Dictionary<string, string> parsedData = ParseQueryString(fragmentData);
+                if (!string.IsNullOrEmpty(fragmentData))
+                {
+                    // Parse the query parameters
+                    Dictionary<string, string> parsedData = ParseQueryString(fragmentData);
 
-            // Signal that we've received the fragment data
-            if (parsedData.Count > 0)
-            {
-                _fragmentReceived.TrySetResult(parsedData);
-                Debug.WriteLine("Successfully parsed and processed fragment data");
-            }
-            else
-            {
-                _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
-                Debug.WriteLine("Empty fragment data received");
-            }
-        }
-        else
-        {
-            _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
-            Debug.WriteLine("No fragment data received");
-        }
+                    // Signal that we've received the fragment data
+                    if (parsedData.Count > 0)
+                    {
+                        _fragmentReceived.TrySetResult(parsedData);
+                        Debug.WriteLine("Successfully parsed and processed fragment data");
+                    }
+                    else
+                    {
+                        _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
+                        Debug.WriteLine("Empty fragment data received");
+                    }
+                }
+                else
+                {
+                    _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
+                    Debug.WriteLine("No fragment data received");
+                }
 
-        // Send a clear success response
-        string responseHtml = @"
+                // Send a clear success response
+                string responseHtml = @"
 <!DOCTYPE html>
 <html>
 <head>
@@ -529,21 +446,21 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 </body>
 </html>";
 
-        byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
-        context.Response.ContentLength64 = buffer.Length;
-        context.Response.ContentType = "text/html";
-        context.Response.StatusCode = 200;
+                byte[] buffer = Encoding.UTF8.GetBytes(responseHtml);
+                context.Response.ContentLength64 = buffer.Length;
+                context.Response.ContentType = "text/html";
+                context.Response.StatusCode = 200;
 
-        await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-        context.Response.OutputStream.Close();
-        Debug.WriteLine("Fragment data processing complete with success response");
-    }
-    catch (Exception ex)
-    {
-        Debug.WriteLine($"Error in ProcessFragmentPostDataAsync: {ex.Message}");
-        throw;
-    }
-}
+                await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                context.Response.OutputStream.Close();
+                Debug.WriteLine("Fragment data processing complete with success response");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error in ProcessFragmentPostDataAsync: {ex.Message}");
+                throw;
+            }
+        }
 
         private async Task SendErrorResponseAsync(HttpListenerContext context, int statusCode, string message)
         {
@@ -817,7 +734,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
                         FileName = browserPath,
-                        Arguments = $"--new-window --app=\"{url}\" -silent",
+                        Arguments = $"--start-minimized --app=\"{url}\" -silent",
                         WindowStyle = ProcessWindowStyle.Minimized,
                         UseShellExecute = true
                     };
