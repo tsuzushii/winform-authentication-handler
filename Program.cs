@@ -1,7 +1,7 @@
 ﻿
 using System;
 using System.Windows.Forms;
-using AG.VC.Oidc.WinForms.AuthenticationHandler;
+
 namespace WinForms_OAuth2ImplicitFlow_Prototype
 {
     static class Program
@@ -14,36 +14,47 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
             // Subscribe to the TokenReceived event
-            AuthenticationManager.TokenReceived += (sender, args) =>
-            {
-                MessageBox.Show($"Token received successfully! User: {args.ClaimsPrincipal.Identity.Name}", 
-                    "Authentication Success", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                Console.WriteLine($"Access Token: {args.AccessToken}");
-            };
+            AuthenticationManager.TokenReceived += OnTokenReceived;
 
             // Subscribe to the TokenFailed event
-            AuthenticationManager.TokenFailed += (sender, reason) =>
-            {
-                MessageBox.Show($"Authentication failed: {reason}", 
-                    "Authentication Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            };
-            //AuthenticationManager.TokenReceived += OnTokenReceived;
-            //var config = new AG.VC.Oidc.WinForms.AuthenticationHandler.AuthConfig
+            AuthenticationManager.TokenFailed += OnTokenFailed;
+
+            // IMPORTANT: Update the redirect URI to match the fixed port used in FixedPortAuthService
             var config = new AuthConfig
             {
                 ClientId = "rgvelod.aginsurance.intranet_phrgvelo",
                 Scope = "openid financingfunds.domain.dev.ag.intranet roles profile",
-                RedirectUri = "https://rgvelod.aginsurance.intranet/",
-                //ClientId = "bspfsscrptd.aginsurance.intranet_phbspfsscrpt",
-                //Scope = "openid jxwwdocumentapid.aginsurance.intranet roles profile",
-                //RedirectUri = "https://bspfsscrptd.aginsurance.intranet/"
+                // Use a fixed port redirect URI that must be whitelisted with your IDP
+                RedirectUri = "http://localhost:54321/callback",
             };
-            //AG.VC.Oidc.WinForms.AuthenticationHandler.AuthenticationManager.Initialize(config);
+
+            // Initialize the authentication manager
             AuthenticationManager.Initialize(config);
 
+            // Run the main form
             Application.Run(new EntryPointForm());
+        }
 
+        private static void OnTokenReceived(object sender, TokenReceivedEventArgs args)
+        {
+            MessageBox.Show(
+                "Authentication successful!\nUser: " + args.ClaimsPrincipal.Identity.Name,
+                "Authentication Success",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+
+        private static void OnTokenFailed(object sender, string reason)
+        {
+            MessageBox.Show(
+                "Authentication failed: " + reason,
+                "Authentication Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
         }
     }
 }

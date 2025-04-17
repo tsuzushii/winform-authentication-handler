@@ -54,11 +54,11 @@
     <Compile Include="EntryPointForm.Designer.cs">
       <DependentUpon>EntryPointForm.cs</DependentUpon>
     </Compile>
-    <Compile Include="IMsaTokenService.cs" />
+    <Compile Include="LocalServerAuthService.cs" />
     <Compile Include="MSAConstants.cs" />
-    <Compile Include="MsaTokenService.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="PuppeterAuthService.cs" />
     <Compile Include="TokenReceivedEventArgs.cs" />
     <EmbeddedResource Include="AuthForm.resx">
       <DependentUpon>AuthForm.cs</DependentUpon>
