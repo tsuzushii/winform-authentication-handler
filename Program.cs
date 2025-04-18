@@ -28,7 +28,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // IMPORTANT: Update the redirect URI to match the fixed port used in FixedPortAuthService
             var config = new AuthConfig
             {
-                ClientId = "rgvelod.aginsurance.intranet_phrgvelo",
+                ClientId = "rgvelod.aginsurance.intranet_phsrgvelo",
                 Scope = "openid financingfunds.domain.dev.ag.intranet roles profile",
                 // Use a fixed port redirect URI that must be whitelisted with your IDP
                 RedirectUri = "http://localhost:54321/callback",
