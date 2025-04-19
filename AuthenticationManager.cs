@@ -1,6 +1,7 @@
 ﻿
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IdentityModel.Tokens.Jwt;
@@ -26,7 +27,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private static AuthConfig _currentConfig;
         public static event EventHandler<TokenReceivedEventArgs> TokenReceived;
         public static event EventHandler<string> TokenFailed;
-
+        private static CancellationTokenSource _authCancellationTokenSource;
         static AuthenticationManager()
         {
             // Initialize token cache service
@@ -51,6 +52,14 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         {
             Debug.WriteLine("AuthenticationManager.Initialize() called");
             _currentConfig = config;
+
+            // Create a new cancellation token source
+            if (_authCancellationTokenSource != null)
+            {
+                _authCancellationTokenSource.Dispose();
+            }
+            _authCancellationTokenSource = new CancellationTokenSource();
+
             // Ensure any existing progress form is closed and disposed
             CloseProgressForm();
 
@@ -71,9 +80,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
                     // Build a token dictionary similar to what we'd get from authentication
                     var tokenDict = new Dictionary<string, string>
-                    {
-                        { MSAConstants.AccessTokenIdentifier, cachedToken }
-                    };
+            {
+                { MSAConstants.AccessTokenIdentifier, cachedToken }
+            };
 
                     // Add any claims from the token
                     foreach (var claim in jwtToken.Claims)
@@ -138,6 +147,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             {
                 try
                 {
+                    // Get cancellation token
+                    var cancellationToken = _authCancellationTokenSource.Token;
+
                     UpdateProgressStatus("Starting authentication process...");
 
                     // Only try headless authentication, no fallback
@@ -147,60 +159,61 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
                     Dictionary<string, string> tokenDict = null;
 
+                    // Check for cancellation
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        Debug.WriteLine("Authentication canceled before starting authentication");
+                        return;
+                    }
+
                     try
                     {
-                        tokenDict = await headlessService.AuthenticateAsync();
+                        // Pass cancellation token to authentication method
+                        tokenDict = await headlessService.AuthenticateAsync(cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Debug.WriteLine("Authentication was canceled by user");
+                        return;
                     }
                     catch (Exception ex)
                     {
                         Debug.WriteLine($"Silent authentication failed: {ex.Message}");
-                        UpdateProgressStatus("Authentication failed: " + ex.Message);
 
-                        // No fallback to visible browser - simply report the error
-                        await Task.Delay(1000); // Give user time to read the message
-                        CloseProgressForm();
+                        // Update UI to show error instead of closing form
+                        UpdateProgressStatus("Authentication failed: " + ex.Message, false, true);
 
+                        // Raise the token failed event
                         RaiseTokenFailed("Authentication failed: " + ex.Message);
-                        return; // Exit the authentication process
+
+                        return; // Exit the authentication process but leave error form visible
+                    }
+
+                    // Check for cancellation again
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        Debug.WriteLine("Authentication canceled after authentication but before processing");
+                        return;
                     }
 
                     // Process successful authentication
                     if (tokenDict != null && tokenDict.ContainsKey(MSAConstants.AccessTokenIdentifier))
                     {
-                        Debug.WriteLine("Silent authentication successful");
-                        OidcAuthenticatedClaimsPrincipal = headlessService.CreateClaimsPrincipal(tokenDict);
-
-                        // Cache the token
-                        _tokenCache.SaveToken(environment, tokenDict[MSAConstants.AccessTokenIdentifier]);
-
-                        UpdateProgressStatus("Authentication successful!");
-                        await Task.Delay(500); // Brief pause to show success message
-
-                        CloseProgressForm();
-                        RaiseTokenReceived(tokenDict[MSAConstants.AccessTokenIdentifier], OidcAuthenticatedClaimsPrincipal);
-
-                        // Setup token refresh
-                        InitializeRefreshTokenTimer(config);
-                        return;
+                        ProcessSuccessfulAuthentication(headlessService, tokenDict, environment);
                     }
                     else
                     {
                         // Handle case where we get a response but no token
                         Debug.WriteLine("Authentication failed - no token received");
-                        UpdateProgressStatus("Authentication failed - no access token received");
-                        await Task.Delay(1000);
-                        CloseProgressForm();
+                        UpdateProgressStatus("Authentication failed - no access token received", false, true);
                         RaiseTokenFailed("Failed to obtain access token");
                     }
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine("Authentication exception: " + ex.Message);
-                    UpdateProgressStatus("Authentication error: " + ex.Message);
-                    ShowEnhancedErrorDialog("Authentication Error", ex.Message);
-                    CloseProgressForm();
+                    UpdateProgressStatus("Authentication error: " + ex.Message, false, true);
                     RaiseTokenFailed(ex.Message);
-                    return;
                 }
             });
         }
@@ -222,13 +235,14 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
+
         private static Form CreateProgressForm()
         {
             var form = new Form
             {
                 Text = "MSA Authentication",
-                Width = 400,
-                Height = 250,
+                Width = 380,
+                Height = 280, // Normal height when no error
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 StartPosition = FormStartPosition.CenterScreen,
                 MaximizeBox = false,
@@ -236,16 +250,18 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 ControlBox = true,
                 ShowIcon = true,
                 BackColor = Color.White,
-                TopMost = true
+                TopMost = true,
+                Padding = new Padding(0)
             };
 
-            // Create a container panel to help with centering
+            // Create a container panel with tighter margins
             var containerPanel = new Panel
             {
                 Width = 360,
-                Height = 210,
-                Location = new Point(20, 10),
-                BackColor = Color.White
+                Height = 260,
+                Location = new Point(10, 10),
+                BackColor = Color.White,
+                Name = "containerPanel"
             };
             form.Controls.Add(containerPanel);
 
@@ -257,6 +273,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 AutoSize = true,
                 TextAlign = ContentAlignment.MiddleCenter,
                 ForeColor = Color.FromArgb(0, 120, 212), // Microsoft blue
+                Tag = "iconLabel",
+                Name = "iconLabel"
             };
             // Calculate center position
             int iconX = (containerPanel.Width - iconLabel.PreferredWidth) / 2;
@@ -272,23 +290,48 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 Width = 360,
                 Height = 30,
                 TextAlign = ContentAlignment.MiddleCenter,
-                Location = new Point(0, 80) // Positioned below icon
+                Location = new Point(0, 80), // Positioned below icon
+                Tag = "titleLabel",
+                Name = "titleLabel"
             };
             containerPanel.Controls.Add(titleLabel);
 
-            // Add a status label - properly centered
+            // Add a status label - properly centered vertically between title and progress bar
             var statusLabel = new Label
             {
                 Text = "Please wait while we authenticate your account",
                 Font = new Font("Segoe UI", 9, FontStyle.Regular),
                 AutoSize = false,
                 Width = 360,
-                Height = 20,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Location = new Point(0, 110), // Positioned below title
-                Tag = "status" // Tag to find this label later
+                Height = 30, // Made taller to accommodate text
+                TextAlign = ContentAlignment.MiddleCenter, // Middle alignment for vertical centering
+                Location = new Point(0, 120), // Better vertical position between title and progress bar
+                Tag = "status",
+                Name = "statusLabel"
             };
             containerPanel.Controls.Add(statusLabel);
+
+            // Add a RichTextBox for log display (initially hidden)
+            var logView = new RichTextBox
+            {
+                ReadOnly = true,
+                BackColor = Color.Black,
+                ForeColor = Color.White,
+                Font = new Font("Consolas", 8.5F),
+                Location = new Point(20, 120), // Same position as status label
+                Size = new Size(320, 0), // Zero height initially
+                BorderStyle = BorderStyle.FixedSingle,
+                Tag = "logView",
+                Name = "logView",
+                Visible = false, // Initially hidden
+                ScrollBars = RichTextBoxScrollBars.Vertical
+            };
+            containerPanel.Controls.Add(logView);
+
+            // Initialize the log with some basic information
+            AddLogEntry(logView, "INFO", "Authentication process started");
+            AddLogEntry(logView, "INFO", "Using headless MS authentication");
+            AddLogEntry(logView, "DEBUG", "Contacting authentication service...");
 
             // Add a nicer progress bar - properly centered
             var progressBar = new ProgressBar
@@ -297,26 +340,37 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 MarqueeAnimationSpeed = 30,
                 Height = 5,
                 Width = 320,
-                Location = new Point(20, 140) // Positioned below status
+                Location = new Point(20, 170), // Positioned below status
+                Tag = "progressBar",
+                Name = "progressBar"
             };
             containerPanel.Controls.Add(progressBar);
 
-            // Add a cancel button - properly centered
+            // Add a cancel button - right below the progress bar with minimal gap
             var cancelButton = new Button
             {
                 Text = "Cancel",
                 Width = 100,
                 Height = 30,
                 FlatStyle = FlatStyle.System,
-                UseVisualStyleBackColor = true
+                UseVisualStyleBackColor = true,
+                Tag = "cancelButton",
+                Name = "cancelButton"
             };
             // Calculate center position
             int buttonX = (containerPanel.Width - cancelButton.Width) / 2;
-            cancelButton.Location = new Point(buttonX, 165);
+            cancelButton.Location = new Point(buttonX, 190); // Minimal gap below progress bar
             cancelButton.Click += (sender, e) =>
             {
+                // Cancel the authentication process
+                if (_authCancellationTokenSource != null && !_authCancellationTokenSource.IsCancellationRequested)
+                {
+                    Debug.WriteLine("Cancellation requested by user button click");
+                    _authCancellationTokenSource.Cancel();
+                }
+
                 form.Close();
-                RaiseTokenFailed("Authentication was canceled by the user.");
+                // Let FormClosing event handle the cancellation notification
             };
             containerPanel.Controls.Add(cancelButton);
 
@@ -325,15 +379,36 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             {
                 if (e.CloseReason == CloseReason.UserClosing)
                 {
-                    Debug.WriteLine("User canceled authentication");
-                    RaiseTokenFailed("Authentication was canceled by the user.");
+                    // Cancel the authentication process if it's still running
+                    if (_authCancellationTokenSource != null && !_authCancellationTokenSource.IsCancellationRequested)
+                    {
+                        Debug.WriteLine("Cancellation requested by form closing");
+                        _authCancellationTokenSource.Cancel();
+                    }
+
+                    // Only trigger user canceled if the tag is true (default) or not set
+                    bool shouldTriggerCanceled = form.Tag == null || (bool)form.Tag;
+
+                    if (shouldTriggerCanceled)
+                    {
+                        Debug.WriteLine("User canceled authentication");
+                        RaiseTokenFailed("Authentication was canceled by the user.");
+                    }
+                    else
+                    {
+                        Debug.WriteLine("Form closing without triggering cancellation");
+                    }
                 }
             };
 
             return form;
         }
 
-        private static void UpdateProgressStatus(string status)
+
+        // Helper method to show a detailed error log window
+
+
+        private static void UpdateProgressStatus(string status, bool isSuccess = false, bool isError = false)
         {
             Debug.WriteLine("Status update: " + status);
 
@@ -351,12 +426,115 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         if (!_progressForm.IsDisposed)
                         {
-                            var statusControls = _progressForm.Controls.Find("status", true);
-                            if (statusControls.Length > 0 && statusControls[0] is Label statusLabel)
+                            // Get the container panel
+                            var containerPanel = _progressForm.Controls.OfType<Panel>().FirstOrDefault();
+                            if (containerPanel == null)
                             {
-                                statusLabel.Text = status;
-                                _progressForm.Update(); // Force immediate UI update
+                                Debug.WriteLine("Container panel not found");
+                                return;
                             }
+
+                            // Get references to controls
+                            var statusLabel = containerPanel.Controls.OfType<Label>()
+                                .FirstOrDefault(l => l.Tag?.ToString() == "status");
+
+                            var iconLabel = containerPanel.Controls.OfType<Label>()
+                                .FirstOrDefault(l => l.Tag?.ToString() == "iconLabel");
+
+                            var titleLabel = containerPanel.Controls.OfType<Label>()
+                                .FirstOrDefault(l => l.Tag?.ToString() == "titleLabel");
+
+                            var progressBar = containerPanel.Controls.OfType<ProgressBar>()
+                                .FirstOrDefault(p => p.Tag?.ToString() == "progressBar");
+
+                            var cancelButton = containerPanel.Controls.OfType<Button>()
+                                .FirstOrDefault(b => b.Tag?.ToString() == "cancelButton");
+
+                            var logView = containerPanel.Controls.OfType<RichTextBox>()
+                                .FirstOrDefault(r => r.Tag?.ToString() == "logView");
+
+                            // Always log the message to the RichTextBox
+                            if (logView != null)
+                            {
+                                string level = isError ? "ERROR" : isSuccess ? "SUCCESS" : "INFO";
+                                AddLogEntry(logView, level, status);
+                            }
+
+                            // Update icon and title based on state
+                            if (isSuccess || isError)
+                            {
+                                if (iconLabel != null)
+                                {
+                                    iconLabel.Text = isSuccess ? "✅" : isError ? "❌" : "🔐";
+                                    iconLabel.ForeColor = isSuccess ? Color.ForestGreen :
+                                                    isError ? Color.Crimson :
+                                                    Color.FromArgb(0, 120, 212);
+                                }
+
+                                if (titleLabel != null)
+                                {
+                                    titleLabel.Text = isSuccess ? "Authentication Successful" :
+                                                isError ? "Authentication Failed" : "Authenticating...";
+                                }
+
+                                // For error state, show log view and resize form
+                                if (isError)
+                                {
+                                    // Update form for error display
+                                    if (statusLabel != null)
+                                        statusLabel.Visible = false; // Hide status label
+
+                                    if (progressBar != null)
+                                        progressBar.Visible = false; // Hide progress bar
+
+                                    // Show log view
+                                    if (logView != null)
+                                    {
+                                        logView.Size = new Size(320, 120); // Expand to full size
+                                        logView.Location = new Point(20, 120); // Position below title
+                                        logView.Visible = true; // Make visible
+                                        logView.ScrollToCaret(); // Auto-scroll to latest entry
+                                    }
+
+                                    // Move button below log view
+                                    if (cancelButton != null)
+                                    {
+                                        cancelButton.Text = "Close";
+                                        cancelButton.Location = new Point(cancelButton.Location.X, 250);
+                                    }
+
+                                    // Resize form to fit everything
+                                    if (_progressForm.Height < 350)
+                                    {
+                                        _progressForm.Height = 350;
+                                        containerPanel.Height = 330;
+                                    }
+                                }
+                                else if (isSuccess)
+                                {
+                                    // For success state, show checkmark and completed progress
+                                    if (progressBar != null)
+                                    {
+                                        progressBar.Style = ProgressBarStyle.Continuous;
+                                        progressBar.Value = 100;
+                                    }
+
+                                    if (statusLabel != null)
+                                    {
+                                        statusLabel.Text = "Authentication successful!";
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                // Normal status update during authentication
+                                if (statusLabel != null)
+                                {
+                                    statusLabel.Text = status;
+                                }
+                            }
+
+                            _progressForm.Update(); // Force immediate UI update
                         }
                     }
                     catch (Exception ex)
@@ -380,7 +558,69 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             }
         }
 
-        private static void CloseProgressForm()
+
+        // Helper method to add debug log entries directly
+        private static void AddLogEntry(RichTextBox logView, string level, string message)
+        {
+            if (logView == null || logView.IsDisposed)
+                return;
+
+            Color levelColor = Color.White;
+            switch (level)
+            {
+                case "ERROR":
+                    levelColor = Color.Red;
+                    break;
+                case "WARNING":
+                    levelColor = Color.Yellow;
+                    break;
+                case "INFO":
+                    levelColor = Color.LightGreen;
+                    break;
+                case "DEBUG":
+                    levelColor = Color.LightBlue;
+                    break;
+            }
+
+            try
+            {
+                Action action = () =>
+                {
+                    // Add timestamp (gray)
+                    string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+                    logView.SelectionStart = logView.TextLength;
+                    logView.SelectionLength = 0;
+                    logView.SelectionColor = Color.Gray;
+                    logView.AppendText(timestamp + " ");
+
+                    // Add level indicator (with appropriate color)
+                    logView.SelectionStart = logView.TextLength;
+                    logView.SelectionLength = 0;
+                    logView.SelectionColor = levelColor;
+                    logView.AppendText("[" + level + "] ");
+
+                    // Add message (white)
+                    logView.SelectionStart = logView.TextLength;
+                    logView.SelectionLength = 0;
+                    logView.SelectionColor = Color.White;
+                    logView.AppendText(message + Environment.NewLine);
+
+                    // Scroll to the end
+                    logView.ScrollToCaret();
+                };
+
+                if (logView.InvokeRequired)
+                    logView.Invoke(action);
+                else
+                    action();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error adding log entry: {ex.Message}");
+            }
+        }
+
+        private static void CloseProgressForm(bool triggerUserCanceled = true)
         {
             if (_progressForm == null)
             {
@@ -399,6 +639,10 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                         if (!formToClose.IsDisposed)
                         {
                             Debug.WriteLine("Closing progress form");
+
+                            // Set a flag to control whether FormClosing should trigger user canceled logic
+                            formToClose.Tag = triggerUserCanceled;
+
                             formToClose.Hide();
                             formToClose.Close();
                             formToClose.Dispose();
@@ -422,226 +666,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             catch (Exception ex)
             {
                 Debug.WriteLine("Error closing progress form: " + ex.Message);
-            }
-        }
-        private static void ShowEnhancedErrorDialog(string title, string errorMessage)
-        {
-            try
-            {
-                // Extract relevant error information
-                string errorCode = "Unknown error";
-                string errorDetail = errorMessage;
-                string correlationId = "N/A";
-
-                // Parse the error message if it follows the expected format
-                if (errorMessage.Contains("Error page content:"))
-                {
-                    // Try to extract error code
-                    Match codeMatch = Regex.Match(errorMessage, @"code ([A-Za-z0-9]+)");
-                    if (codeMatch.Success && codeMatch.Groups.Count > 1)
-                    {
-                        errorCode = codeMatch.Groups[1].Value;
-                    }
-
-                    // Try to extract correlation ID if present
-                    Match correlationMatch = Regex.Match(errorMessage, @"Correlation :\s*([a-f0-9-]+)");
-                    if (correlationMatch.Success && correlationMatch.Groups.Count > 1)
-                    {
-                        correlationId = correlationMatch.Groups[1].Value;
-                    }
-
-                    // Extract the detailed message
-                    int contentIndex = errorMessage.IndexOf("Error page content:") + "Error page content:".Length;
-                    if (contentIndex > 0 && contentIndex < errorMessage.Length)
-                    {
-                        string content = errorMessage.Substring(contentIndex).Trim();
-
-                        // Further extract just the error message without correlation ID
-                        int correlationIndex = content.IndexOf("- Session Correlation");
-                        if (correlationIndex > 0)
-                        {
-                            content = content.Substring(0, correlationIndex).Trim();
-                        }
-
-                        errorDetail = content;
-                    }
-                }
-
-                // Create a custom error form instead of using MessageBox
-                using (Form errorForm = new Form())
-                {
-                    errorForm.Text = "Authentication Error";
-                    errorForm.Size = new Size(500, 350);
-                    errorForm.FormBorderStyle = FormBorderStyle.FixedDialog;
-                    errorForm.StartPosition = FormStartPosition.CenterScreen;
-                    errorForm.MaximizeBox = false;
-                    errorForm.MinimizeBox = false;
-                    errorForm.BackColor = Color.White;
-                    errorForm.Font = new Font("Segoe UI", 9F);
-                    errorForm.ShowIcon = true;
-                    errorForm.ShowInTaskbar = true;
-
-                    // Create the main container panel
-                    Panel mainPanel = new Panel
-                    {
-                        Dock = DockStyle.Fill,
-                        Padding = new Padding(20)
-                    };
-                    errorForm.Controls.Add(mainPanel);
-
-                    // Header with warning icon
-                    Label iconLabel = new Label
-                    {
-                        Text = "⚠️",
-                        Font = new Font("Segoe UI", 36),
-                        AutoSize = true,
-                        ForeColor = Color.FromArgb(232, 17, 35), // Red
-                        Location = new Point(20, 10)
-                    };
-                    mainPanel.Controls.Add(iconLabel);
-
-                    // Title
-                    Label titleLabel = new Label
-                    {
-                        Text = "Authentication Failed",
-                        Font = new Font("Segoe UI", 16, FontStyle.Bold),
-                        AutoSize = true,
-                        Location = new Point(80, 20)
-                    };
-                    mainPanel.Controls.Add(titleLabel);
-
-                    // Create a panel for the error details with a nice border
-                    Panel detailsPanel = new Panel
-                    {
-                        Width = 440,
-                        Height = 180,
-                        Location = new Point(20, 70),
-                        BorderStyle = BorderStyle.FixedSingle,
-                        BackColor = Color.FromArgb(245, 245, 245) // Light gray background
-                    };
-                    mainPanel.Controls.Add(detailsPanel);
-                    // Error message
-                    Label messageLabel = new Label
-                    {
-                        Text = errorDetail,
-                        Font = new Font("Segoe UI", 10),
-                        Location = new Point(10, 10),
-                        Size = new Size(420, 50),
-                        ForeColor = Color.FromArgb(50, 50, 50)
-                    };
-                    detailsPanel.Controls.Add(messageLabel);
-
-                    // Error code with label
-                    Label codeLabel = new Label
-                    {
-                        Text = "Error Code:",
-                        Font = new Font("Segoe UI", 9, FontStyle.Bold),
-                        AutoSize = true,
-                        Location = new Point(10, 70),
-                        ForeColor = Color.FromArgb(50, 50, 50)
-                    };
-                    detailsPanel.Controls.Add(codeLabel);
-
-                    Label codeValueLabel = new Label
-                    {
-                        Text = errorCode,
-                        Font = new Font("Segoe UI", 9),
-                        AutoSize = true,
-                        Location = new Point(120, 70),
-                        ForeColor = Color.FromArgb(50, 50, 50)
-                    };
-                    detailsPanel.Controls.Add(codeValueLabel);
-
-                    // Correlation ID with label
-                    Label correlationLabel = new Label
-                    {
-                        Text = "Correlation ID:",
-                        Font = new Font("Segoe UI", 9, FontStyle.Bold),
-                        AutoSize = true,
-                        Location = new Point(10, 100),
-                        ForeColor = Color.FromArgb(50, 50, 50)
-                    };
-                    detailsPanel.Controls.Add(correlationLabel);
-
-                    Label correlationValueLabel = new Label
-                    {
-                        Text = correlationId,
-                        Font = new Font("Segoe UI", 9),
-                        AutoSize = true,
-                        Location = new Point(120, 100),
-                        Size = new Size(310, 40),
-                        ForeColor = Color.FromArgb(50, 50, 50)
-                    };
-                    detailsPanel.Controls.Add(correlationValueLabel);
-
-                    // Additional help text
-                    Label helpLabel = new Label
-                    {
-                        Text = "Please contact IT support if this issue persists.",
-                        Font = new Font("Segoe UI", 9, FontStyle.Italic),
-                        AutoSize = true,
-                        Location = new Point(10, 140),
-                        ForeColor = Color.FromArgb(100, 100, 100)
-                    };
-                    detailsPanel.Controls.Add(helpLabel);
-
-                    // OK button
-                    Button okButton = new Button
-                    {
-                        Text = "OK",
-                        Size = new Size(100, 35),
-                        Location = new Point(360, 260),
-                        BackColor = Color.FromArgb(0, 120, 212), // Blue
-                        ForeColor = Color.White,
-                        FlatStyle = FlatStyle.Flat,
-                        Font = new Font("Segoe UI", 9, FontStyle.Bold)
-                    };
-                    okButton.FlatAppearance.BorderSize = 0;
-                    okButton.Click += (s, e) => errorForm.Close();
-                    mainPanel.Controls.Add(okButton);
-
-                    // Try again button
-                    Button retryButton = new Button
-                    {
-                        Text = "Try Again",
-                        Size = new Size(100, 35),
-                        Location = new Point(250, 260),
-                        BackColor = Color.White,
-                        ForeColor = Color.FromArgb(0, 120, 212),
-                        FlatStyle = FlatStyle.Flat,
-                        Font = new Font("Segoe UI", 9)
-                    };
-                    retryButton.FlatAppearance.BorderColor = Color.FromArgb(0, 120, 212);
-                    retryButton.Click += (s, e) =>
-                    {
-                        errorForm.DialogResult = DialogResult.Retry;
-                        errorForm.Close();
-                    };
-                    mainPanel.Controls.Add(retryButton);
-                    // Show the form
-                    if (Application.OpenForms.Count > 0 && Application.OpenForms[0] != null)
-                    {
-                        Application.OpenForms[0].Invoke((MethodInvoker)delegate {
-                            DialogResult result = errorForm.ShowDialog();
-                            if (result == DialogResult.Retry)
-                            {
-                                // Handle retry logic here if needed
-                                ClearTokenCache();
-                                Initialize(_currentConfig);
-                            }
-                        });
-                    }
-                    else
-                    {
-                        errorForm.ShowDialog();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error showing enhanced error dialog: {ex.Message}");
-                // Fall back to regular message box if something goes wrong
-                MessageBox.Show(errorMessage, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
         private static void InitializeRefreshTokenTimer(AuthConfig config)
@@ -750,6 +774,30 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             Debug.WriteLine("Using default expiry time");
             return DateTime.UtcNow.AddHours(1);
         }
+
+        private static void ProcessSuccessfulAuthentication(HeadlessMsaService authService, Dictionary<string, string> tokenDict, string environment)
+        {
+            Debug.WriteLine("Silent authentication successful");
+            OidcAuthenticatedClaimsPrincipal = authService.CreateClaimsPrincipal(tokenDict);
+
+            // Cache the token
+            _tokenCache.SaveToken(environment, tokenDict[MSAConstants.AccessTokenIdentifier]);
+
+            UpdateProgressStatus("Authentication successful!", true); // Added success parameter
+
+            // Setup token refresh
+            InitializeRefreshTokenTimer(_currentConfig);
+
+            // Raise token received event
+            RaiseTokenReceived(tokenDict[MSAConstants.AccessTokenIdentifier], OidcAuthenticatedClaimsPrincipal);
+
+            // Delay to show success message, then close form
+            Task.Run(async () => {
+                await Task.Delay(1500); // Brief pause to show success message
+                CloseProgressForm(false); // false means don't trigger "user canceled"
+            });
+        }
+
         /// <summary>
         /// Clears the authentication token cache and forces re-authentication on next attempt
         /// </summary>

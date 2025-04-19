@@ -11,6 +11,7 @@ using System.Linq;
 using System.Net;
 using System.Security.Claims;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
 
@@ -40,7 +41,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         /// Authenticates the user silently using a headless browser
         /// </summary>
         /// <returns>Dictionary of token information</returns>
-        public async Task<Dictionary<string, string>> AuthenticateAsync()
+        public async Task<Dictionary<string, string>> AuthenticateAsync(CancellationToken cancellationToken = default)
         {
             _logCallback("Starting headless authentication...");
 
@@ -52,6 +53,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
             try
             {
+                // Check for cancellation
+                cancellationToken.ThrowIfCancellationRequested();
+
                 // Create the authorization URL with your config
                 string state = CryptoRandom.CreateUniqueId();
                 string nonce = CryptoRandom.CreateUniqueId();
@@ -78,20 +82,20 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     DefaultViewport = new ViewPortOptions { Width = 1920, Height = 1080 },
                     Args = new string[]
                     {
-                        "--no-sandbox",
-                        "--disable-gpu",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-background-networking",
-                        "--disable-default-apps",
-                        "--disable-sync",
-                        "--disable-translate",
-                        "--disable-renderer-backgrounding",
-                        "--disable-backgrounding-occluded-windows",
-                        "--disable-breakpad",
-                        "--disable-extensions",
-                        "--disable-infobars",
-                        "--disable-background-timer-throttling"
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-breakpad",
+                "--disable-extensions",
+                "--disable-infobars",
+                "--disable-background-timer-throttling"
                     }
                 };
 
@@ -105,8 +109,28 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
                 launchOptions.ExecutablePath = edgePath;
 
+                // Check for cancellation before launching browser
+                cancellationToken.ThrowIfCancellationRequested();
+
                 browser = await Puppeteer.LaunchAsync(launchOptions);
                 _logCallback("Browser launched successfully");
+
+                // Register cancellation callback to close browser
+                cancellationToken.Register(async () =>
+                {
+                    _logCallback("Cancellation requested, closing browser...");
+                    try
+                    {
+                        if (browser != null && !browser.IsClosed)
+                        {
+                            await browser.CloseAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logCallback($"Error closing browser on cancellation: {ex.Message}");
+                    }
+                });
 
                 page = await browser.NewPageAsync();
                 await page.SetCacheEnabledAsync(true);
@@ -201,23 +225,44 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 await page.GoToAsync(url);
                 _logCallback("Navigated to authentication URL, waiting for completion...");
 
-                // Wait for authentication to complete or timeout
-                Task timeoutTask = Task.Delay(AuthenticationTimeoutMilliseconds);
-                Task resultTask = Task.Run(async () =>
+                // Wait for authentication to complete, cancellation, or timeout
+                var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(AuthenticationTimeoutMilliseconds));
+                var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+                try
                 {
-                    while (!authenticationCompleted && string.IsNullOrEmpty(exceptionMessage))
+                    await Task.Run(async () =>
                     {
-                        await Task.Delay(200);
-                    }
-                });
-
-                await Task.WhenAny(timeoutTask, resultTask);
-
-                if (timeoutTask.IsCompleted && !authenticationCompleted)
-                {
-                    exceptionMessage = "Authentication timed out";
-                    _logCallback("Authentication timed out");
+                        while (!authenticationCompleted && string.IsNullOrEmpty(exceptionMessage))
+                        {
+                            linkedCts.Token.ThrowIfCancellationRequested();
+                            await Task.Delay(200, linkedCts.Token);
+                        }
+                    }, linkedCts.Token);
                 }
+                catch (OperationCanceledException)
+                {
+                    if (timeoutCts.IsCancellationRequested)
+                    {
+                        exceptionMessage = "Authentication timed out";
+                        _logCallback("Authentication timed out");
+                    }
+                    else
+                    {
+                        _logCallback("Authentication canceled by user");
+                        throw; // Rethrow the cancellation exception
+                    }
+                }
+                finally
+                {
+                    timeoutCts.Dispose();
+                    linkedCts.Dispose();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _logCallback("Authentication was canceled");
+                throw; // Rethrow to notify caller of cancellation
             }
             catch (Exception ex)
             {
@@ -229,8 +274,15 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 // Clean up resources
                 if (browser != null)
                 {
-                    await browser.CloseAsync();
-                    await browser.DisposeAsync();
+                    try
+                    {
+                        await browser.CloseAsync();
+                        await browser.DisposeAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logCallback($"Error disposing browser: {ex.Message}");
+                    }
                 }
             }
 
