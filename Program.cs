@@ -1,5 +1,8 @@
 ﻿
 using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace WinForms_OAuth2ImplicitFlow_Prototype
@@ -18,7 +21,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // Create and show the main form first - this is important for UI thread handling
             var mainForm = new EntryPointForm();
             mainForm.Show();
-
+            AuthenticationManager.ClearTokenCache();
             // Subscribe to the TokenReceived event
             AuthenticationManager.TokenReceived += OnTokenReceived;
 
@@ -28,10 +31,10 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // IMPORTANT: Update the redirect URI to match the fixed port used in FixedPortAuthService
             var config = new AuthConfig
             {
-                ClientId = "rgvelod.aginsurance.intranet_phsrgvelo",
+                ClientId = "rgvelod.aginsurance.intranet_phrsgvelo",
                 Scope = "openid financingfunds.domain.dev.ag.intranet roles profile",
-                // Use a fixed port redirect URI that must be whitelisted with your IDP
-                RedirectUri = "http://localhost:54321/callback",
+                //RedirectUri = "http://localhost:54321/callback",
+                RedirectUri = "https://rgvelod.aginsurance.intranet/",
             };
 
             // Initialize the authentication manager
@@ -49,16 +52,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         private static void OnTokenFailed(object sender, string reason)
         {
-            // Only show error if it's not a user cancellation
-            if (!reason.Contains("canceled by the user"))
-            {
-                MessageBox.Show(
-                    "Authentication failed: " + reason,
-                    "Authentication Error",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
-            }
+            Console.WriteLine("Auth Failed");
         }
     }
 }

@@ -7,7 +7,6 @@ using System.IO;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Net;
-using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text;
 using System.Threading;
@@ -25,48 +24,18 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private const int AuthenticationTimeoutMilliseconds = 120000; // 2 minutes
         private const int FixedPort = 54321; // Fixed port - make sure this is whitelisted with your IDP
         private readonly Action<string> _logMessage;
-        private readonly bool _hideBrowser;
-        private Process _browserProcess;
         private TaskCompletionSource<Dictionary<string, string>> _fragmentReceived;
         private string _state;
         private string _nonce;
-        private WebBrowser _hiddenBrowser;
-        private CancellationTokenSource _minimizerCts;
-        private Form _progressForm;
+        private Process _browserProcess;
+        private CancellationTokenSource _cancellationTokenSource;
         private bool _isAuthenticationSuccessful = false;
         private bool _isProcessingFragment = false;
-     
-
-        // Win32 API for window manipulation
-        [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("user32.dll")]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-
-        [DllImport("user32.dll")]
-        private static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
-
-        [DllImport("user32.dll")]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern IntPtr SendMessage(IntPtr hWnd, UInt32 Msg, IntPtr wParam, IntPtr lParam);
-
-        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-        // Window constants
-        private const int SW_MINIMIZE = 6;
-        private const UInt32 WM_CLOSE = 0x0010;
 
         public FixedPortAuthService(AuthConfig authConfig, Action<string> statusCallback = null, bool hideBrowser = false)
         {
             _authConfig = authConfig ?? throw new ArgumentNullException(nameof(authConfig));
             _logMessage = statusCallback ?? ((message) => { Debug.WriteLine(message); });
-            _hideBrowser = hideBrowser;
 
             // Generate state and nonce for security
             _state = IdentityModel.CryptoRandom.CreateUniqueId();
@@ -84,10 +53,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             _isAuthenticationSuccessful = false;
             _isProcessingFragment = false;
 
-            // Show the progress form
-            ShowProgressForm();
-
             _fragmentReceived = new TaskCompletionSource<Dictionary<string, string>>();
+            _cancellationTokenSource = new CancellationTokenSource();
 
             //Create a fixed redirect URI using the specified port
             string redirectUri = $"http://localhost:{FixedPort}/callback";
@@ -105,7 +72,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         httpListener.Start();
                         _logMessage("Listener started successfully");
-                        UpdateProgressStatus("HTTP listener started successfully");
                     }
                     catch (HttpListenerException ex)
                     {
@@ -130,12 +96,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 {
                     //Clean up
                     CleanupResources(httpListener);
-
-                    // Only close progress form if it wasn't already closed during success processing
-                    if (!_isAuthenticationSuccessful)
-                    {
-                        CloseProgressForm();
-                    }
                 }
             }
         }
@@ -165,7 +125,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private string BuildAuthorizationUrl(string redirectUri)
         {
             _logMessage("Preparing authentication URL...");
-            UpdateProgressStatus("Preparing authentication URL");
 
             var request = new RequestUrl(GetAuthorizeUrlBasedOnEnvironment());
             var url = request.CreateAuthorizeUrl(
@@ -182,17 +141,14 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             return url;
         }
 
-
         private async Task LaunchBrowserAndListenForCallback(string authUrl, HttpListener httpListener)
         {
             _logMessage("Launching browser...");
-            UpdateProgressStatus("Launching authentication browser");
 
             // Launch browser
-            if (!LaunchHiddenBrowser(authUrl))
+            if (!LaunchBrowser(authUrl))
             {
                 _logMessage("Error: Failed to launch browser.");
-                UpdateProgressStatus("Failed to launch browser");
                 throw new InvalidOperationException("Failed to launch browser. Please check if a browser is installed.");
             }
 
@@ -202,8 +158,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // Set up timeout and wait for authentication
             using (var cts = new CancellationTokenSource(AuthenticationTimeoutMilliseconds))
             {
+                _cancellationTokenSource = cts;
+
                 _logMessage("Waiting for authentication in browser...");
-                UpdateProgressStatus("Waiting for authentication...");
 
                 try
                 {
@@ -220,33 +177,79 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     ValidateAuthenticationResponse(tokenDict);
 
                     _logMessage("Authentication successful!");
-                    UpdateProgressStatus("Authentication successful!");
-
-                    // Add a small delay to make sure the browser has time to process the success page
-                    await Task.Delay(1000);
-
-                    // Now terminate the browser
-                    TerminateBrowserProcess();
+                    _isAuthenticationSuccessful = true;
                 }
                 catch (TimeoutException)
                 {
                     _logMessage("Authentication timed out. Please try again.");
-                    UpdateProgressStatus("Authentication timed out. Please try again.");
                     _isAuthenticationSuccessful = false;
-                    TerminateBrowserProcess();
                     throw;
                 }
                 catch (Exception ex)
                 {
                     _logMessage($"Authentication error: {ex.Message}");
-                    UpdateProgressStatus($"Authentication error: {ex.Message}");
                     _isAuthenticationSuccessful = false;
-                    TerminateBrowserProcess();
                     throw;
                 }
             }
         }
 
+        public void CancelAuthentication()
+        {
+            Debug.WriteLine("Authentication canceled by user");
+
+            // Cancel the authentication task
+            if (_cancellationTokenSource != null && !_cancellationTokenSource.IsCancellationRequested)
+            {
+                _cancellationTokenSource.Cancel();
+            }
+
+            // Use taskkill to terminate any browser processes we started
+            if (_browserProcess != null)
+            {
+                try
+                {
+                    int processId = _browserProcess.Id;
+                    KillProcessAndChildren(processId);
+                    _browserProcess = null;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error killing browser process: {ex.Message}");
+                }
+            }
+
+            // Make sure we also set any completion status if needed
+            if (!_fragmentReceived.Task.IsCompleted)
+            {
+                _fragmentReceived.TrySetCanceled();
+            }
+        }
+
+        private void KillProcessAndChildren(int pid)
+        {
+            try
+            {
+                Debug.WriteLine($"Using taskkill to terminate process tree for PID: {pid}");
+                using (Process taskkill = new Process())
+                {
+                    taskkill.StartInfo.FileName = "taskkill.exe";
+                    taskkill.StartInfo.Arguments = $"/F /T /PID {pid}";
+                    taskkill.StartInfo.UseShellExecute = false;
+                    taskkill.StartInfo.CreateNoWindow = true;
+                    taskkill.Start();
+
+                    // Wait for up to 2 seconds for the kill process to complete
+                    taskkill.WaitForExit(2000);
+
+                    Debug.WriteLine("Process tree termination completed");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error killing process tree: {ex.Message}");
+            }
+        }
 
         private Task StartListenerTask(HttpListener httpListener)
         {
@@ -329,6 +332,12 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     httpListener.Stop();
                     Debug.WriteLine("HTTP listener stopped");
                 }
+
+                if (_cancellationTokenSource != null)
+                {
+                    _cancellationTokenSource.Dispose();
+                    _cancellationTokenSource = null;
+                }
             }
             catch (Exception ex)
             {
@@ -347,7 +356,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 if (path.StartsWith("/callback"))
                 {
                     await SendCallbackPageAsync(context);
-                    UpdateProgressStatus("Processing authentication callback");
+                    _logMessage("Processing authentication callback");
                 }
                 else if (path.StartsWith("/fragment"))
                 {
@@ -487,20 +496,20 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         fragmentProcessed = _fragmentReceived.TrySetResult(parsedData);
                         Debug.WriteLine($"Successfully parsed and processed fragment data: {fragmentProcessed}");
-                        UpdateProgressStatus("Authentication data received");
+                        _logMessage("Authentication data received");
                     }
                     else
                     {
                         fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("Empty fragment data"));
                         Debug.WriteLine($"Empty fragment data received: {fragmentProcessed}");
-                        UpdateProgressStatus("Error: Empty authentication data");
+                        _logMessage("Error: Empty authentication data");
                     }
                 }
                 else
                 {
                     fragmentProcessed = _fragmentReceived.TrySetException(new InvalidOperationException("No fragment data received"));
                     Debug.WriteLine($"No fragment data received: {fragmentProcessed}");
-                    UpdateProgressStatus("Error: No authentication data received");
+                    _logMessage("Error: No authentication data received");
                 }
 
                 // Send a clear success response
@@ -709,341 +718,27 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             return fragmentData;
         }
 
-        private bool LaunchHiddenBrowser(string url)
+        private bool LaunchBrowser(string url)
         {
             try
             {
-                // Stop any existing minimizer
-                StopMinimizeThread();
-
-                // Get browser path - try Edge first (usually more reliable)
-                string browserPath = GetEdgeBrowserExecutable();
-                if (string.IsNullOrEmpty(browserPath))
+                // Simply use the system's default browser to open the URL
+                ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    browserPath = GetChromeBrowserExecutable();
-                }
+                    FileName = url,
+                    UseShellExecute = true
+                };
 
-                _logMessage("Launching browser with minimal window...");
-                UpdateProgressStatus("Launching browser...");
-
-                if (!string.IsNullOrEmpty(browserPath))
-                {
-                    // For Chrome/Edge, a combination of flags that's most likely to work
-                    ProcessStartInfo psi = new ProcessStartInfo
-                    {
-                        FileName = browserPath,
-                        // Key arguments to try to keep minimized
-                        Arguments = $"--new-window --start-minimized \"{url}\"",
-                        WindowStyle = ProcessWindowStyle.Minimized,
-                        UseShellExecute = true
-                    };
-
-                    _browserProcess = Process.Start(psi);
-                    _logMessage($"Browser process started with ID: {_browserProcess?.Id}");
-                }
-                else
-                {
-                    // Fallback to default browser
-                    _logMessage("Using default browser...");
-                    ProcessStartInfo psi = new ProcessStartInfo
-                    {
-                        FileName = url,
-                        WindowStyle = ProcessWindowStyle.Minimized,
-                        UseShellExecute = true
-                    };
-
-                    _browserProcess = Process.Start(psi);
-                }
-
-                // Start the minimizer thread to continuously keep the browser minimized
-                StartMinimizeThread();
+                _browserProcess = Process.Start(psi);
+                Debug.WriteLine($"Browser launched with URL: {url}");
 
                 return true;
             }
             catch (Exception ex)
             {
-                _logMessage($"Error launching browser: {ex.Message}");
-                Debug.WriteLine($"Launch browser error: {ex.Message}");
+                Debug.WriteLine($"Error launching browser: {ex.Message}");
                 return false;
             }
-        }
-
-        private void StopMinimizeThread()
-        {
-            if (_minimizerCts != null)
-            {
-                try
-                {
-                    _minimizerCts.Cancel();
-                    _minimizerCts.Dispose();
-                }
-                catch { /* Ignore */ }
-                _minimizerCts = null;
-            }
-        }
-
-        private void StartMinimizeThread()
-        {
-            // This is the main minimizer that continues during the authentication process
-            if (_minimizerCts == null)
-            {
-                _minimizerCts = new CancellationTokenSource();
-            }
-
-            Task.Run(() => {
-                try
-                {
-                    // Keep trying to minimize windows for 2 minutes (or until cancelled)
-                    DateTime startTime = DateTime.Now;
-                    while ((DateTime.Now - startTime).TotalMinutes < 2 && !_minimizerCts.Token.IsCancellationRequested)
-                    {
-                        // Minimize the browser window
-                        MinimizeBrowser();
-
-                        // Check less frequently over time for performance
-                        if ((DateTime.Now - startTime).TotalSeconds < 10)
-                        {
-                            Thread.Sleep(100); // Check frequently at first
-                        }
-                        else if ((DateTime.Now - startTime).TotalSeconds < 30)
-                        {
-                            Thread.Sleep(500); // Check less often after 10 seconds
-                        }
-                        else
-                        {
-                            Thread.Sleep(1000); // Check rarely after 30 seconds
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Minimizer thread error: {ex.Message}");
-                }
-            }, _minimizerCts.Token);
-        }
-
-        private void MinimizeBrowser()
-        {
-            try
-            {
-                int browserPid = _browserProcess?.Id ?? -1;
-
-                // If we don't have a browser process ID, there's nothing to do
-                if (browserPid <= 0) return;
-
-                // Use EnumWindows to find all top-level windows
-                EnumWindows(new EnumWindowsProc((hWnd, lParam) => {
-                    try
-                    {
-                        // Skip invisible windows
-                        if (!IsWindowVisible(hWnd))
-                            return true;
-
-                        // Get the process ID for this window
-                        uint windowPid;
-                        GetWindowThreadProcessId(hWnd, out windowPid);
-
-                        // Only minimize windows belonging to our browser process
-                        if (windowPid == browserPid)
-                        {
-                            ShowWindow(hWnd, SW_MINIMIZE);
-
-                            // Optional: log the window title for debugging
-                            StringBuilder sb = new StringBuilder(256);
-                            GetWindowText(hWnd, sb, sb.Capacity);
-                            Debug.WriteLine($"Minimized browser window: {sb.ToString()}");
-                        }
-                    }
-                    catch { /* Ignore errors in window checks */ }
-
-                    // Continue enumeration
-                    return true;
-                }), IntPtr.Zero);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"MinimizeBrowser error: {ex.Message}");
-            }
-        }
-
-        private void TerminateBrowserProcess()
-        {
-            // Stop the minimizer thread
-            StopMinimizeThread();
-
-            // Check if we actually should close the browser
-            if (!_isAuthenticationSuccessful)
-            {
-                Debug.WriteLine("Authentication failed, leaving browser open for error display");
-                _logMessage("Authentication failed, leaving browser open to show error details");
-
-                // Don't kill browser on failure, but still clear the process reference
-                _browserProcess = null;
-                return;
-            }
-
-            // Store the browser process information first since we might lose access to it
-            string processName = "unknown";
-            int processId = -1;
-
-            try
-            {
-                if (_browserProcess != null)
-                {
-                    // Capture process info before trying to access it further
-                    processName = _browserProcess.ProcessName;
-                    processId = _browserProcess.Id;
-
-                    Debug.WriteLine($"Preparing to terminate browser: Process name={processName}, ID={processId}");
-
-                    try
-                    {
-                        // Check if process is already exited
-                        if (!_browserProcess.HasExited)
-                        {
-                            // Get all windows associated with this process
-                            List<IntPtr> windowHandles = new List<IntPtr>();
-
-                            EnumWindows(new EnumWindowsProc((hWnd, lParam) => {
-                                try
-                                {
-                                    // Skip invisible windows
-                                    if (!IsWindowVisible(hWnd))
-                                        return true;
-
-                                    // Get the process ID for this window
-                                    uint windowPid;
-                                    GetWindowThreadProcessId(hWnd, out windowPid);
-
-                                    // Only collect windows belonging to our browser process
-                                    if (windowPid == processId)
-                                    {
-                                        windowHandles.Add(hWnd);
-                                    }
-                                }
-                                catch { /* Ignore errors in window checks */ }
-
-                                // Continue enumeration
-                                return true;
-                            }), IntPtr.Zero);
-
-                            // Close each window gracefully first
-                            foreach (var handle in windowHandles)
-                            {
-                                try
-                                {
-                                    Debug.WriteLine("Sending close message to browser window");
-                                    SendMessage(handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-                                }
-                                catch { /* Continue if we can't close a window */ }
-                            }
-
-                            // Wait a moment for windows to close
-                            Thread.Sleep(500);
-
-                            // Now try to kill the process directly if it's still running
-                            if (!_browserProcess.HasExited)
-                            {
-                                _browserProcess.Kill();
-                                Debug.WriteLine("Browser process kill command sent");
-                            }
-                            else
-                            {
-                                Debug.WriteLine("Browser process has already exited");
-                            }
-                        }
-                        else
-                        {
-                            Debug.WriteLine("Browser process has already exited");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"Error during kill operation: {ex.Message}");
-                    }
-
-                    // Always dispose of the process object regardless of whether kill worked
-                    try
-                    {
-                        _browserProcess.Dispose();
-                    }
-                    catch { }
-
-                    _browserProcess = null;
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error accessing browser process: {ex.Message}");
-            }
-
-            // IMPORTANT: Do NOT use taskkill here as it would close all browser instances
-            Debug.WriteLine("Browser termination completed for authentication session");
-        }
-
-        private static string GetEdgeBrowserExecutable()
-        {
-            // Try to find Edge (Chromium-based) browser from common locations
-            string[] possibleEdgePaths = new string[]
-            {
-                // Edge stable channel
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                    "Microsoft", "Edge", "Application", "msedge.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                    "Microsoft", "Edge", "Application", "msedge.exe"),
-                
-                // Edge Beta/Dev channels
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                    "Microsoft", "Edge Beta", "Application", "msedge.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                    "Microsoft", "Edge Beta", "Application", "msedge.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
-                    "Microsoft", "Edge Dev", "Application", "msedge.exe"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                    "Microsoft", "Edge Dev", "Application", "msedge.exe")
-            };
-
-            foreach (string path in possibleEdgePaths)
-            {
-                if (File.Exists(path))
-                {
-                    return path;
-                }
-            }
-
-            // Try registry as fallback
-            string regPath = Registry.GetValue(
-                "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msedge.exe",
-                null,
-                null
-            ) as string;
-
-            if (!string.IsNullOrEmpty(regPath) && File.Exists(regPath))
-            {
-                return regPath;
-            }
-
-            return string.Empty;
-        }
-
-        private static string GetChromeBrowserExecutable()
-        {
-            string chromePath = Registry.GetValue(
-                "HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
-                null,
-                null
-            ) as string;
-
-            if (string.IsNullOrEmpty(chromePath))
-            {
-                chromePath = Registry.GetValue(
-                    "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe",
-                    null,
-                    null
-                ) as string;
-            }
-
-            return chromePath ?? string.Empty;
         }
 
         private string GetAuthorizeUrlBasedOnEnvironment()
@@ -1131,27 +826,5 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 identity.AddClaim(new Claim(ClaimsIdentity.DefaultNameClaimType, cleanName));
             }
         }
-
-        #region Progress Form Methods
-
-        private void ShowProgressForm()
-        {
-            // Don't create a progress form here - let AuthenticationManager handle it
-            _logMessage("Progress tracking is handled by AuthenticationManager");
-        }
-
-        private void UpdateProgressStatus(string status)
-        {
-            // Forward status updates to the log message handler
-            _logMessage(status);
-        }
-
-        private void CloseProgressForm()
-        {
-            // Don't close the progress form - let AuthenticationManager handle it
-            _logMessage("Progress form will be closed by AuthenticationManager");
-        }
-
-        #endregion
     }
 }

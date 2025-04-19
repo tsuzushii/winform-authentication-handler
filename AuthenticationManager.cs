@@ -3,7 +3,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
 using System.Security.Claims;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -16,12 +19,19 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private static System.Timers.Timer refreshTimer;
         private static TimeSpan bufferTime;
         private static SynchronizationContext _uiContext;
-        private static bool _hideBrowser = true; // Set to true to hide the browser window
-        private static bool _useCustomProgressIndicator = true; // Set to true to use our custom progress indicator
-        private static Form _progressForm = null; // Keep a static reference to the progress form
-
+        private static bool _hideBrowser = true; // Default to headless mode
+        private static bool _useCustomProgressIndicator = true;
+        private static Form _progressForm = null;
+        private static TokenCacheService _tokenCache;
+        private static AuthConfig _currentConfig;
         public static event EventHandler<TokenReceivedEventArgs> TokenReceived;
         public static event EventHandler<string> TokenFailed;
+
+        static AuthenticationManager()
+        {
+            // Initialize token cache service
+            _tokenCache = new TokenCacheService(message => Debug.WriteLine($"TokenCache: {message}"));
+        }
 
         internal static void RaiseTokenReceived(string accessToken, ClaimsPrincipal claimsPrincipal)
         {
@@ -40,11 +50,57 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         public static void Initialize(AuthConfig config)
         {
             Debug.WriteLine("AuthenticationManager.Initialize() called");
-
+            _currentConfig = config;
             // Ensure any existing progress form is closed and disposed
             CloseProgressForm();
 
             _uiContext = SynchronizationContext.Current ?? new SynchronizationContext();
+
+            // Try to load token from cache first
+            var environment = Fortis.FIBE.XN.Environment.SystemInfo.Current.SystemEnvironment;
+            var cachedToken = _tokenCache.LoadToken(environment);
+
+            if (!string.IsNullOrEmpty(cachedToken))
+            {
+                Debug.WriteLine("Found valid token in cache - using it instead of authenticating");
+                // Create principal from cached token
+                try
+                {
+                    var handler = new JwtSecurityTokenHandler();
+                    var jwtToken = handler.ReadJwtToken(cachedToken);
+
+                    // Build a token dictionary similar to what we'd get from authentication
+                    var tokenDict = new Dictionary<string, string>
+                    {
+                        { MSAConstants.AccessTokenIdentifier, cachedToken }
+                    };
+
+                    // Add any claims from the token
+                    foreach (var claim in jwtToken.Claims)
+                    {
+                        if (!tokenDict.ContainsKey(claim.Type))
+                        {
+                            tokenDict[claim.Type] = claim.Value;
+                        }
+                    }
+
+                    // Create principal and raise the token event
+                    var authService = new HeadlessMsaService(config);
+                    OidcAuthenticatedClaimsPrincipal = authService.CreateClaimsPrincipal(tokenDict);
+
+                    RaiseTokenReceived(cachedToken, OidcAuthenticatedClaimsPrincipal);
+
+                    // Setup token refresh
+                    InitializeRefreshTokenTimer(config);
+
+                    return; // Skip authentication process
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error using cached token: {ex.Message}");
+                    // Continue with authentication if there's an error with cached token
+                }
+            }
 
             if (_useCustomProgressIndicator && Application.OpenForms.Count > 0)
             {
@@ -76,11 +132,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     _useCustomProgressIndicator = false;
                 }
             }
-            else
-            {
-                Debug.WriteLine("Not showing progress indicator: UseCustomIndicator=" + _useCustomProgressIndicator +
-                               ", OpenForms.Count=" + Application.OpenForms.Count);
-            }
 
             // Start authentication in background thread
             Task.Run(async () =>
@@ -89,55 +140,67 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 {
                     UpdateProgressStatus("Starting authentication process...");
 
-                    // Create and use the fixed port authentication service
-                    var authService = new FixedPortAuthService(
-                        config,
-                        UpdateProgressStatus,
-                        _hideBrowser);
+                    // Only try headless authentication, no fallback
+                    UpdateProgressStatus("Attempting silent authentication...");
+                    var headlessService = new HeadlessMsaService(config,
+                        message => UpdateProgressStatus($"Auth: {message}"));
 
-                    var tokenDict = await authService.AuthenticateAsync();
+                    Dictionary<string, string> tokenDict = null;
+
+                    try
+                    {
+                        tokenDict = await headlessService.AuthenticateAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Silent authentication failed: {ex.Message}");
+                        UpdateProgressStatus("Authentication failed: " + ex.Message);
+
+                        // No fallback to visible browser - simply report the error
+                        await Task.Delay(1000); // Give user time to read the message
+                        CloseProgressForm();
+
+                        RaiseTokenFailed("Authentication failed: " + ex.Message);
+                        return; // Exit the authentication process
+                    }
 
                     // Process successful authentication
                     if (tokenDict != null && tokenDict.ContainsKey(MSAConstants.AccessTokenIdentifier))
                     {
-                        Debug.WriteLine("Authentication successful, creating claims principal");
-                        OidcAuthenticatedClaimsPrincipal = authService.CreateClaimsPrincipal(tokenDict);
+                        Debug.WriteLine("Silent authentication successful");
+                        OidcAuthenticatedClaimsPrincipal = headlessService.CreateClaimsPrincipal(tokenDict);
 
-                        // Update status before closing
+                        // Cache the token
+                        _tokenCache.SaveToken(environment, tokenDict[MSAConstants.AccessTokenIdentifier]);
+
                         UpdateProgressStatus("Authentication successful!");
+                        await Task.Delay(500); // Brief pause to show success message
 
-                        // Close the progress form
                         CloseProgressForm();
-
                         RaiseTokenReceived(tokenDict[MSAConstants.AccessTokenIdentifier], OidcAuthenticatedClaimsPrincipal);
 
                         // Setup token refresh
                         InitializeRefreshTokenTimer(config);
+                        return;
                     }
                     else
                     {
-                        Debug.WriteLine("Authentication failed - no token dictionary or no access token");
-                        UpdateProgressStatus("Authentication failed - no access token");
-
-                        // Give UI time to update
+                        // Handle case where we get a response but no token
+                        Debug.WriteLine("Authentication failed - no token received");
+                        UpdateProgressStatus("Authentication failed - no access token received");
                         await Task.Delay(1000);
-
                         CloseProgressForm();
                         RaiseTokenFailed("Failed to obtain access token");
-                        ShowErrorMessage("Authentication Failed", "Failed to obtain access token");
                     }
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine("Authentication exception: " + ex.Message);
                     UpdateProgressStatus("Authentication error: " + ex.Message);
-
-                    // Give UI time to update
-                    await Task.Delay(1000);
-
+                    ShowEnhancedErrorDialog("Authentication Error", ex.Message);
                     CloseProgressForm();
-                    RaiseTokenFailed("Authentication failed: " + ex.Message);
-                    ShowErrorMessage("Authentication Error", "Authentication failed: " + ex.Message);
+                    RaiseTokenFailed(ex.Message);
+                    return;
                 }
             });
         }
@@ -361,28 +424,226 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 Debug.WriteLine("Error closing progress form: " + ex.Message);
             }
         }
-
-        private static void ShowErrorMessage(string title, string message)
+        private static void ShowEnhancedErrorDialog(string title, string errorMessage)
         {
             try
             {
-                if (Application.OpenForms.Count > 0 && Application.OpenForms[0] != null)
+                // Extract relevant error information
+                string errorCode = "Unknown error";
+                string errorDetail = errorMessage;
+                string correlationId = "N/A";
+
+                // Parse the error message if it follows the expected format
+                if (errorMessage.Contains("Error page content:"))
                 {
-                    Application.OpenForms[0].Invoke((MethodInvoker)delegate {
-                        MessageBox.Show(message, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    });
+                    // Try to extract error code
+                    Match codeMatch = Regex.Match(errorMessage, @"code ([A-Za-z0-9]+)");
+                    if (codeMatch.Success && codeMatch.Groups.Count > 1)
+                    {
+                        errorCode = codeMatch.Groups[1].Value;
+                    }
+
+                    // Try to extract correlation ID if present
+                    Match correlationMatch = Regex.Match(errorMessage, @"Correlation :\s*([a-f0-9-]+)");
+                    if (correlationMatch.Success && correlationMatch.Groups.Count > 1)
+                    {
+                        correlationId = correlationMatch.Groups[1].Value;
+                    }
+
+                    // Extract the detailed message
+                    int contentIndex = errorMessage.IndexOf("Error page content:") + "Error page content:".Length;
+                    if (contentIndex > 0 && contentIndex < errorMessage.Length)
+                    {
+                        string content = errorMessage.Substring(contentIndex).Trim();
+
+                        // Further extract just the error message without correlation ID
+                        int correlationIndex = content.IndexOf("- Session Correlation");
+                        if (correlationIndex > 0)
+                        {
+                            content = content.Substring(0, correlationIndex).Trim();
+                        }
+
+                        errorDetail = content;
+                    }
                 }
-                else
+
+                // Create a custom error form instead of using MessageBox
+                using (Form errorForm = new Form())
                 {
-                    Debug.WriteLine($"ERROR - {title}: {message}");
+                    errorForm.Text = "Authentication Error";
+                    errorForm.Size = new Size(500, 350);
+                    errorForm.FormBorderStyle = FormBorderStyle.FixedDialog;
+                    errorForm.StartPosition = FormStartPosition.CenterScreen;
+                    errorForm.MaximizeBox = false;
+                    errorForm.MinimizeBox = false;
+                    errorForm.BackColor = Color.White;
+                    errorForm.Font = new Font("Segoe UI", 9F);
+                    errorForm.ShowIcon = true;
+                    errorForm.ShowInTaskbar = true;
+
+                    // Create the main container panel
+                    Panel mainPanel = new Panel
+                    {
+                        Dock = DockStyle.Fill,
+                        Padding = new Padding(20)
+                    };
+                    errorForm.Controls.Add(mainPanel);
+
+                    // Header with warning icon
+                    Label iconLabel = new Label
+                    {
+                        Text = "⚠️",
+                        Font = new Font("Segoe UI", 36),
+                        AutoSize = true,
+                        ForeColor = Color.FromArgb(232, 17, 35), // Red
+                        Location = new Point(20, 10)
+                    };
+                    mainPanel.Controls.Add(iconLabel);
+
+                    // Title
+                    Label titleLabel = new Label
+                    {
+                        Text = "Authentication Failed",
+                        Font = new Font("Segoe UI", 16, FontStyle.Bold),
+                        AutoSize = true,
+                        Location = new Point(80, 20)
+                    };
+                    mainPanel.Controls.Add(titleLabel);
+
+                    // Create a panel for the error details with a nice border
+                    Panel detailsPanel = new Panel
+                    {
+                        Width = 440,
+                        Height = 180,
+                        Location = new Point(20, 70),
+                        BorderStyle = BorderStyle.FixedSingle,
+                        BackColor = Color.FromArgb(245, 245, 245) // Light gray background
+                    };
+                    mainPanel.Controls.Add(detailsPanel);
+                    // Error message
+                    Label messageLabel = new Label
+                    {
+                        Text = errorDetail,
+                        Font = new Font("Segoe UI", 10),
+                        Location = new Point(10, 10),
+                        Size = new Size(420, 50),
+                        ForeColor = Color.FromArgb(50, 50, 50)
+                    };
+                    detailsPanel.Controls.Add(messageLabel);
+
+                    // Error code with label
+                    Label codeLabel = new Label
+                    {
+                        Text = "Error Code:",
+                        Font = new Font("Segoe UI", 9, FontStyle.Bold),
+                        AutoSize = true,
+                        Location = new Point(10, 70),
+                        ForeColor = Color.FromArgb(50, 50, 50)
+                    };
+                    detailsPanel.Controls.Add(codeLabel);
+
+                    Label codeValueLabel = new Label
+                    {
+                        Text = errorCode,
+                        Font = new Font("Segoe UI", 9),
+                        AutoSize = true,
+                        Location = new Point(120, 70),
+                        ForeColor = Color.FromArgb(50, 50, 50)
+                    };
+                    detailsPanel.Controls.Add(codeValueLabel);
+
+                    // Correlation ID with label
+                    Label correlationLabel = new Label
+                    {
+                        Text = "Correlation ID:",
+                        Font = new Font("Segoe UI", 9, FontStyle.Bold),
+                        AutoSize = true,
+                        Location = new Point(10, 100),
+                        ForeColor = Color.FromArgb(50, 50, 50)
+                    };
+                    detailsPanel.Controls.Add(correlationLabel);
+
+                    Label correlationValueLabel = new Label
+                    {
+                        Text = correlationId,
+                        Font = new Font("Segoe UI", 9),
+                        AutoSize = true,
+                        Location = new Point(120, 100),
+                        Size = new Size(310, 40),
+                        ForeColor = Color.FromArgb(50, 50, 50)
+                    };
+                    detailsPanel.Controls.Add(correlationValueLabel);
+
+                    // Additional help text
+                    Label helpLabel = new Label
+                    {
+                        Text = "Please contact IT support if this issue persists.",
+                        Font = new Font("Segoe UI", 9, FontStyle.Italic),
+                        AutoSize = true,
+                        Location = new Point(10, 140),
+                        ForeColor = Color.FromArgb(100, 100, 100)
+                    };
+                    detailsPanel.Controls.Add(helpLabel);
+
+                    // OK button
+                    Button okButton = new Button
+                    {
+                        Text = "OK",
+                        Size = new Size(100, 35),
+                        Location = new Point(360, 260),
+                        BackColor = Color.FromArgb(0, 120, 212), // Blue
+                        ForeColor = Color.White,
+                        FlatStyle = FlatStyle.Flat,
+                        Font = new Font("Segoe UI", 9, FontStyle.Bold)
+                    };
+                    okButton.FlatAppearance.BorderSize = 0;
+                    okButton.Click += (s, e) => errorForm.Close();
+                    mainPanel.Controls.Add(okButton);
+
+                    // Try again button
+                    Button retryButton = new Button
+                    {
+                        Text = "Try Again",
+                        Size = new Size(100, 35),
+                        Location = new Point(250, 260),
+                        BackColor = Color.White,
+                        ForeColor = Color.FromArgb(0, 120, 212),
+                        FlatStyle = FlatStyle.Flat,
+                        Font = new Font("Segoe UI", 9)
+                    };
+                    retryButton.FlatAppearance.BorderColor = Color.FromArgb(0, 120, 212);
+                    retryButton.Click += (s, e) =>
+                    {
+                        errorForm.DialogResult = DialogResult.Retry;
+                        errorForm.Close();
+                    };
+                    mainPanel.Controls.Add(retryButton);
+                    // Show the form
+                    if (Application.OpenForms.Count > 0 && Application.OpenForms[0] != null)
+                    {
+                        Application.OpenForms[0].Invoke((MethodInvoker)delegate {
+                            DialogResult result = errorForm.ShowDialog();
+                            if (result == DialogResult.Retry)
+                            {
+                                // Handle retry logic here if needed
+                                ClearTokenCache();
+                                Initialize(_currentConfig);
+                            }
+                        });
+                    }
+                    else
+                    {
+                        errorForm.ShowDialog();
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error showing message: {ex.Message}");
+                Debug.WriteLine($"Error showing enhanced error dialog: {ex.Message}");
+                // Fall back to regular message box if something goes wrong
+                MessageBox.Show(errorMessage, title, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
-
         private static void InitializeRefreshTokenTimer(AuthConfig config)
         {
             Debug.WriteLine("Setting up token refresh timer");
@@ -462,7 +723,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
             try
             {
-                var handler = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler();
+                var handler = new JwtSecurityTokenHandler();
                 var jwtToken = handler.ReadJwtToken(accessToken);
 
                 foreach (var claim in jwtToken.Claims)
@@ -488,6 +749,35 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // Fallback if claim not found or could not be parsed
             Debug.WriteLine("Using default expiry time");
             return DateTime.UtcNow.AddHours(1);
+        }
+        /// <summary>
+        /// Clears the authentication token cache and forces re-authentication on next attempt
+        /// </summary>
+        public static void ClearTokenCache()
+        {
+            Debug.WriteLine("Clearing token cache");
+
+            // Get current environment
+            string environment = Fortis.FIBE.XN.Environment.SystemInfo.Current.SystemEnvironment;
+
+            // Clear token cache
+            if (_tokenCache != null)
+            {
+                _tokenCache.DeleteToken(environment);
+            }
+
+            // Reset principal
+            OidcAuthenticatedClaimsPrincipal = null;
+
+            // Stop refresh timer
+            if (refreshTimer != null)
+            {
+                refreshTimer.Stop();
+                refreshTimer.Dispose();
+                refreshTimer = null;
+            }
+
+            Debug.WriteLine("Token cache cleared");
         }
     }
 }

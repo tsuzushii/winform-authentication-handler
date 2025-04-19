@@ -32,5 +32,9 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         /// To minimize the risk of network resolution, it is recommended to opt for a redirect_uri that doesn't exist.
         /// </value>
         public string RedirectUri { get; set; }
+
+        public bool KeepBrowserOpenOnError { get; set; } = true;
+        public bool HideBrowserWindow { get; set; } = true;
+        public int AuthTimeoutSeconds { get; set; } = 120;
     }
 }
