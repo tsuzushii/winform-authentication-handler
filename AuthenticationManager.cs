@@ -20,7 +20,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         private static System.Timers.Timer refreshTimer;
         private static TimeSpan bufferTime;
         private static SynchronizationContext _uiContext;
-        private static bool _hideBrowser = true; // Default to headless mode
         private static bool _useCustomProgressIndicator = true;
         private static Form _progressForm = null;
         private static TokenCacheService _tokenCache;
@@ -28,6 +27,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         public static event EventHandler<TokenReceivedEventArgs> TokenReceived;
         public static event EventHandler<string> TokenFailed;
         private static CancellationTokenSource _authCancellationTokenSource;
+        private static bool _authFailedRaised = false;
         static AuthenticationManager()
         {
             // Initialize token cache service
@@ -36,6 +36,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         internal static void RaiseTokenReceived(string accessToken, ClaimsPrincipal claimsPrincipal)
         {
+            _authFailedRaised = false; // Reset for next auth attempt
             TokenReceived?.Invoke(null, new TokenReceivedEventArgs
             {
                 AccessToken = accessToken,
@@ -45,13 +46,27 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
 
         internal static void RaiseTokenFailed(string reason)
         {
-            TokenFailed?.Invoke(null, reason);
+            // Only raise the event if we haven't already raised a failure for this authentication attempt
+            if (!_authFailedRaised)
+            {
+                _authFailedRaised = true;
+                Debug.WriteLine($"Raising TokenFailed event: {reason}");
+                TokenFailed?.Invoke(null, reason);
+            }
+            else
+            {
+                Debug.WriteLine($"TokenFailed event suppressed (already raised): {reason}");
+            }
         }
 
         public static void Initialize(AuthConfig config)
         {
             Debug.WriteLine("AuthenticationManager.Initialize() called");
             _currentConfig = config;
+            _authFailedRaised = false;
+
+            // Set whether to use the custom progress indicator based on config
+            _useCustomProgressIndicator = config.ShowAuthenticationUI;
 
             // Create a new cancellation token source
             if (_authCancellationTokenSource != null)
@@ -111,6 +126,7 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                 }
             }
 
+            // Only show the progress form if UI is enabled
             if (_useCustomProgressIndicator && Application.OpenForms.Count > 0)
             {
                 try
@@ -180,13 +196,16 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         Debug.WriteLine($"Silent authentication failed: {ex.Message}");
 
-                        // Update UI to show error instead of closing form
-                        UpdateProgressStatus("Authentication failed: " + ex.Message, false, true);
+                        // Only update UI if we're showing the progress form
+                        if (_useCustomProgressIndicator)
+                        {
+                            UpdateProgressStatus("Authentication failed: " + ex.Message, false, true);
+                        }
 
                         // Raise the token failed event
                         RaiseTokenFailed("Authentication failed: " + ex.Message);
 
-                        return; // Exit the authentication process but leave error form visible
+                        return; // Exit the authentication process
                     }
 
                     // Check for cancellation again
@@ -205,14 +224,24 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         // Handle case where we get a response but no token
                         Debug.WriteLine("Authentication failed - no token received");
-                        UpdateProgressStatus("Authentication failed - no access token received", false, true);
+
+                        if (_useCustomProgressIndicator)
+                        {
+                            UpdateProgressStatus("Authentication failed - no access token received", false, true);
+                        }
+
                         RaiseTokenFailed("Failed to obtain access token");
                     }
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine("Authentication exception: " + ex.Message);
-                    UpdateProgressStatus("Authentication error: " + ex.Message, false, true);
+
+                    if (_useCustomProgressIndicator)
+                    {
+                        UpdateProgressStatus("Authentication error: " + ex.Message, false, true);
+                    }
+
                     RaiseTokenFailed(ex.Message);
                 }
             });
@@ -379,20 +408,15 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             {
                 if (e.CloseReason == CloseReason.UserClosing)
                 {
-                    // Cancel the authentication process if it's still running
-                    if (_authCancellationTokenSource != null && !_authCancellationTokenSource.IsCancellationRequested)
+                    // Only trigger cancellation if the tag is true (default) or not set
+                    bool shouldTriggerCancellation = form.Tag == null || (bool)form.Tag;
+
+                    if (shouldTriggerCancellation && _authCancellationTokenSource != null &&
+                        !_authCancellationTokenSource.IsCancellationRequested)
                     {
                         Debug.WriteLine("Cancellation requested by form closing");
                         _authCancellationTokenSource.Cancel();
-                    }
-
-                    // Only trigger user canceled if the tag is true (default) or not set
-                    bool shouldTriggerCanceled = form.Tag == null || (bool)form.Tag;
-
-                    if (shouldTriggerCanceled)
-                    {
-                        Debug.WriteLine("User canceled authentication");
-                        RaiseTokenFailed("Authentication was canceled by the user.");
+                        // No explicit RaiseTokenFailed - let the exception handler do it
                     }
                     else
                     {
@@ -400,7 +424,6 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     }
                 }
             };
-
             return form;
         }
 
@@ -412,9 +435,8 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         {
             Debug.WriteLine("Status update: " + status);
 
-            if (_progressForm == null || _progressForm.IsDisposed)
+            if (!_useCustomProgressIndicator || _progressForm == null || _progressForm.IsDisposed)
             {
-                Debug.WriteLine("Progress form is null or disposed when trying to update status");
                 return;
             }
 
@@ -638,10 +660,18 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
                     {
                         if (!formToClose.IsDisposed)
                         {
-                            Debug.WriteLine("Closing progress form");
+                            // Only cancel the authentication process if requested
+                            if (triggerUserCanceled && _authCancellationTokenSource != null &&
+                                !_authCancellationTokenSource.IsCancellationRequested)
+                            {
+                                Debug.WriteLine("Cancellation requested by form closing");
+                                _authCancellationTokenSource.Cancel();
+                                // No explicit RaiseTokenFailed here - the cancellation will trigger
+                                // a navigation exception that will be caught and will raise the event
+                            }
 
-                            // Set a flag to control whether FormClosing should trigger user canceled logic
-                            formToClose.Tag = triggerUserCanceled;
+                            // Set tag to false to prevent FormClosing from triggering another cancellation
+                            formToClose.Tag = false;
 
                             formToClose.Hide();
                             formToClose.Close();
@@ -783,7 +813,11 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // Cache the token
             _tokenCache.SaveToken(environment, tokenDict[MSAConstants.AccessTokenIdentifier]);
 
-            UpdateProgressStatus("Authentication successful!", true); // Added success parameter
+            // Only update UI if we're showing it
+            if (_useCustomProgressIndicator)
+            {
+                UpdateProgressStatus("Authentication successful!", true);
+            }
 
             // Setup token refresh
             InitializeRefreshTokenTimer(_currentConfig);
@@ -791,11 +825,15 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
             // Raise token received event
             RaiseTokenReceived(tokenDict[MSAConstants.AccessTokenIdentifier], OidcAuthenticatedClaimsPrincipal);
 
-            // Delay to show success message, then close form
-            Task.Run(async () => {
-                await Task.Delay(1500); // Brief pause to show success message
-                CloseProgressForm(false); // false means don't trigger "user canceled"
-            });
+            // Only close the form if we're showing UI
+            if (_useCustomProgressIndicator)
+            {
+                // Delay to show success message, then close form
+                Task.Run(async () => {
+                    await Task.Delay(1500); // Brief pause to show success message
+                    CloseProgressForm(false); // false means don't trigger "user canceled"
+                });
+            }
         }
 
         /// <summary>

@@ -1,4 +1,5 @@
-﻿using System.Windows.Forms;
+﻿
+using System.Windows.Forms;
 
 namespace WinForms_OAuth2ImplicitFlow_Prototype
 {
@@ -33,8 +34,11 @@ namespace WinForms_OAuth2ImplicitFlow_Prototype
         /// </value>
         public string RedirectUri { get; set; }
 
-        public bool KeepBrowserOpenOnError { get; set; } = true;
-        public bool HideBrowserWindow { get; set; } = true;
-        public int AuthTimeoutSeconds { get; set; } = 120;
+        /// <summary>
+        /// Gets or sets whether to show any UI during authentication.
+        /// If false, authentication happens completely in the background with no progress dialog.
+        /// The application should handle TokenReceived and TokenFailed events.
+        /// </summary>
+        public bool ShowAuthenticationUI { get; set; } = true;
     }
 }
